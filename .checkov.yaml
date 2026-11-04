@@ -1,0 +1,10 @@
+compact: true
+quiet: true
+download-external-modules: false
+framework:
+  - github_actions
+  - github_configuration
+  - secrets
+skip-path:
+  - target
+  - .git

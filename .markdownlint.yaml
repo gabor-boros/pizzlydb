@@ -1,0 +1,7 @@
+default: true
+
+# Prose and URLs in the vision doc are not wrapped to a column width.
+MD013: false
+
+MD024:
+  siblings_only: true

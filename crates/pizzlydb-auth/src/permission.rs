@@ -1,0 +1,1 @@
+//! Namespace and administrative permissions.

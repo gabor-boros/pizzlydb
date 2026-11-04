@@ -1,0 +1,34 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0" # x-release-please-version
+license = "Apache-2.0"
+publish = false
+authors = ["Gabor Boros <gabor.brs@gmail.com>"]
+repository = "https://github.com/gabor-boros/pizzlydb"
+homepage = "https://github.com/gabor-boros/pizzlydb"
+readme = "README.md"
+rust-version = "1.88"
+
+# Max runtime performance for shipped binaries. Compile time is secondary.
+# Native CPU tuning stays off (WI-EP02-01); builds stay portable across the
+# declared target triples.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+# Matches README `cargo clippy --workspace --all-targets -- -D warnings`.
+# Pedantic stays off to avoid mass churn unrelated to correctness.
+all = "warn"
+pedantic = { level = "allow", priority = -1 }

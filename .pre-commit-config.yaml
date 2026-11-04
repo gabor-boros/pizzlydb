@@ -1,0 +1,100 @@
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: check-executables-have-shebangs
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: mixed-line-ending
+      - id: detect-private-key
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: cba56bcde1fdd01c1deb3f945e69764c291a6530 # v1.38.0
+    hooks:
+      - id: yamllint
+        args: [--strict]
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: cbcdc463be5464e25e3e955a511599a67b9b987f # v0.50.0
+    hooks:
+      - id: markdownlint
+
+  - repo: https://github.com/crate-ci/typos
+    rev: 7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+    hooks:
+      - id: typos
+        args: [--force-exclude]
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0494aa7fa1314e98913a41227d8f0a515b2c1049 # 0.38.2
+    hooks:
+      - id: check-github-workflows
+      - id: check-github-actions
+      - id: check-renovate
+      - id: check-github-workflows-require-timeout
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: c92afdf2c6ca336aaa8f39e2bd8d48f62dbd8e1f # v1.31.1
+    hooks:
+      - id: zizmor
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
+    hooks:
+      - id: gitleaks
+        entry: gitleaks detect --source . --no-git --redact --no-banner --config .gitleaks.toml
+        pass_filenames: false
+
+  - repo: https://github.com/bridgecrewio/checkov
+    rev: dfeb34b2d52a269bb417b4d4f7854a16bef06629 # 3.3.30
+    hooks:
+      # Upstream matches Terraform only. This repo is scanned for GitHub, container, and secret config.
+      - id: checkov
+        files: \.(ya?ml|json|tf)$|(^|/)Dockerfile
+        exclude: (^|/)(\.terraform|target)(/|$)
+
+  - repo: https://github.com/iddinkgroup/pre-commit-mirrors-trivy
+    rev: 82f66feec953b3b16a7e78fa7cc5d900e9e5b305 # v0.75.0
+    hooks:
+      - id: trivy-fs
+        args: [--config, trivy.yaml, --no-progress, --disable-telemetry, .]
+
+  - repo: https://github.com/fsfe/reuse-tool
+    rev: a1bb792acda6fd0724936b4ebbdbc8eceb9c0459 # v6.2.0
+    hooks:
+      - id: reuse
+
+  - repo: https://github.com/alessandrojcm/commitlint-pre-commit-hook
+    rev: 1f1ac45c93d1c2ce36b71330252c489a5f4f2724 # v9.27.0
+    hooks:
+      - id: commitlint
+        stages: [commit-msg]
+        additional_dependencies: ["@commitlint/config-conventional"]
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all -- --deny warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

@@ -1,0 +1,130 @@
+name: Setup Rust
+description: Install the toolchain declared in rust-toolchain.toml, cache Cargo, and install optional tools.
+
+inputs:
+  tools:
+    description: Comma-separated taiki-e/install-action tool names. Skipped when empty.
+    required: false
+    default: ""
+  extra-targets:
+    description: Additional rustup targets, comma-separated. Appended to rust-toolchain.toml.
+    required: false
+    default: ""
+  cache-key:
+    description: Extra Cargo cache key. Release builds pass the target triple.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # A master SHA does not select a toolchain from the action ref, and passing
+    # a hardcoded channel would override rust-toolchain.toml. Read the file and
+    # pass those values through.
+    - name: Read rust-toolchain.toml
+      id: toolchain-file
+      shell: bash
+      env:
+        EXTRA_TARGETS: ${{ inputs.extra-targets }}
+      run: |
+        set -euo pipefail
+        file="rust-toolchain.toml"
+        if [ ! -f "${file}" ]; then
+          printf 'missing rust-toolchain.toml\n' >&2
+          exit 1
+        fi
+
+        channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${file}")"
+        channel="${channel%%$'\n'*}"
+        case "${channel}" in
+          ""|*[!A-Za-z0-9._+-]*)
+            printf 'rust-toolchain.toml has an unexpected channel\n' >&2
+            exit 1
+            ;;
+        esac
+
+        read_array() {
+          key="$1"
+          awk -v key="${key}" '
+            BEGIN { capture = 0 }
+            $0 ~ "^[[:space:]]*" key "[[:space:]]*=" { capture = 1 }
+            capture { buf = buf $0 "\n" }
+            capture && /\]/ { capture = 0 }
+            END {
+              if (buf == "") {
+                exit 0
+              }
+              n = split(buf, parts, /"/)
+              out = ""
+              for (i = 2; i < n; i += 2) {
+                if (out != "") {
+                  out = out ","
+                }
+                out = out parts[i]
+              }
+              printf "%s", out
+            }
+          ' "${file}"
+        }
+
+        components="$(read_array components)"
+        targets="$(read_array targets)"
+        if [ -n "${EXTRA_TARGETS}" ]; then
+          case "${EXTRA_TARGETS}" in
+            *[!A-Za-z0-9._,-]*)
+              printf 'extra rustup targets contain an unexpected character\n' >&2
+              exit 1
+              ;;
+          esac
+          if [ -n "${targets}" ]; then
+            targets="${targets},${EXTRA_TARGETS}"
+          else
+            targets="${EXTRA_TARGETS}"
+          fi
+        fi
+        if [ -n "${components}" ]; then
+          IFS=',' read -r -a component_list <<< "${components}"
+          for component in "${component_list[@]}"; do
+            case "${component}" in
+              ""|*[!A-Za-z0-9._-]*)
+                printf 'rust-toolchain.toml has an unexpected component\n' >&2
+                exit 1
+                ;;
+            esac
+          done
+        fi
+        if [ -n "${targets}" ]; then
+          IFS=',' read -r -a target_list <<< "${targets}"
+          for target in "${target_list[@]}"; do
+            case "${target}" in
+              ""|*[!A-Za-z0-9._-]*)
+                printf 'rust-toolchain.toml has an unexpected target\n' >&2
+                exit 1
+                ;;
+            esac
+          done
+        fi
+
+        {
+          printf 'channel=%s\n' "${channel}"
+          printf 'components=%s\n' "${components}"
+          printf 'targets=%s\n' "${targets}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      with:
+        toolchain: ${{ steps.toolchain-file.outputs.channel }}
+        components: ${{ steps.toolchain-file.outputs.components }}
+        targets: ${{ steps.toolchain-file.outputs.targets }}
+
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        key: ${{ inputs.cache-key }}
+
+    - name: Install tools
+      if: inputs.tools != ''
+      uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      with:
+        tool: ${{ inputs.tools }}

@@ -1,0 +1,352 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-please-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # open the release pull request and push Cargo.lock
+      pull-requests: write # open or update the release pull request
+      actions: write # rust-cache while syncing Cargo.lock
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN != '' && secrets.RELEASE_PLEASE_TOKEN || github.token }}
+
+      - name: Resolve release pull requests
+        id: release-pr
+        if: steps.release.outputs.prs_created == 'true'
+        shell: bash
+        env:
+          RELEASE_PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_PRS}" ]; then
+            printf 'prs_created is true but prs is empty\n' >&2
+            exit 1
+          fi
+          count="$(jq 'length' <<< "${RELEASE_PRS}")"
+          if [ "${count}" -lt 1 ]; then
+            printf 'prs_created is true but prs contains no pull requests\n' >&2
+            exit 1
+          fi
+          while IFS= read -r branch; do
+            case "${branch}" in
+              ""|null|-*|.*|*[!A-Za-z0-9._/-]*|*..*)
+                printf 'refusing unexpected release pull request branch\n' >&2
+                exit 1
+                ;;
+            esac
+          done < <(jq -r '.[].headBranchName' <<< "${RELEASE_PRS}")
+          first="$(jq -r '.[0].headBranchName' <<< "${RELEASE_PRS}")"
+          printf 'head_branch=%s\n' "${first}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout release pull request
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release-pr.outputs.head_branch }}
+          persist-credentials: true
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN != '' && secrets.RELEASE_PLEASE_TOKEN || github.token }}
+
+      - name: Setup Rust
+        if: steps.release.outputs.prs_created == 'true'
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+
+      - name: Sync Cargo.lock
+        if: steps.release.outputs.prs_created == 'true'
+        shell: bash
+        env:
+          RELEASE_PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          set -euo pipefail
+          sync_lockfile() {
+            local branch="$1"
+            git fetch origin "refs/heads/${branch}"
+            git checkout -B "${branch}" FETCH_HEAD
+            cargo generate-lockfile
+            if [ -z "$(git status --porcelain -- Cargo.lock)" ]; then
+              printf 'Cargo.lock is unchanged on %s\n' "${branch}"
+              return 0
+            fi
+            git add -- Cargo.lock
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "chore: sync Cargo.lock"
+            git push origin "HEAD:${branch}"
+          }
+
+          while IFS= read -r branch; do
+            case "${branch}" in
+              ""|null|-*|.*|*[!A-Za-z0-9._/-]*|*..*)
+                printf 'refusing unexpected release pull request branch\n' >&2
+                exit 1
+                ;;
+            esac
+            sync_lockfile "${branch}"
+          done < <(jq -r '.[].headBranchName' <<< "${RELEASE_PRS}")
+
+  release:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # upload the SBOM to the GitHub release
+      id-token: write # sign the SBOM attestation
+      attestations: write # publish the SBOM attestation
+      actions: write # rust-cache
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+        with:
+          tools: cargo-deny,cargo-audit,cargo-cyclonedx
+      - name: Supply chain
+        uses: ./.github/actions/supply-chain # zizmor: ignore[self-repository]
+      - name: Attest SBOM
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: sbom/*.cdx.json
+      - name: Upload SBOM to the GitHub release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "${RELEASE_TAG}" in
+            *[!A-Za-z0-9._-]*|"")
+              printf 'refusing unexpected release tag\n' >&2
+              exit 1
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              ;;
+            *)
+              printf 'refusing unexpected release tag\n' >&2
+              exit 1
+              ;;
+          esac
+          shopt -s nullglob
+          files=(sbom/*.cdx.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            printf 'no SBOM files to upload\n' >&2
+            exit 1
+          fi
+          gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber
+
+  # Linux x86_64 and aarch64. No macOS, Windows, or Homebrew archives.
+  build:
+    name: build (${{ matrix.target }})
+    needs: [release-please, release]
+    if: >-
+      needs.release-please.outputs.release_created == 'true' &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # upload the release archives
+      id-token: write # sign archive provenance
+      attestations: write # publish archive provenance
+      actions: write # rust-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET: ${{ matrix.target }}
+      RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+      USE_CROSS: ${{ matrix.cross == true && 'true' || 'false' }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+        with:
+          extra-targets: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+          tools: ${{ matrix.cross == true && 'cross' || '' }}
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${TARGET}" in
+            x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
+              ;;
+            *)
+              printf 'refusing unexpected target\n' >&2
+              exit 1
+              ;;
+          esac
+          case "${USE_CROSS}" in
+            true|false)
+              ;;
+            *)
+              printf 'refusing unexpected cross flag\n' >&2
+              exit 1
+              ;;
+          esac
+          if [ "${USE_CROSS}" = "true" ] && [ "${TARGET}" != "aarch64-unknown-linux-gnu" ]; then
+            printf 'cross builds are only for aarch64-unknown-linux-gnu\n' >&2
+            exit 1
+          fi
+          case "${RELEASE_TAG}" in
+            *[!A-Za-z0-9._-]*|"")
+              printf 'refusing unexpected release tag\n' >&2
+              exit 1
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              ;;
+            *)
+              printf 'refusing unexpected release tag\n' >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "${USE_CROSS}" = "true" ]; then
+            cross build --release --locked -p pizzlydb-cli --target "${TARGET}"
+            # cross writes target/ as root, which breaks the Cargo cache otherwise.
+            sudo chown -R "$(id -u):$(id -g)" target
+          else
+            cargo build --release --locked -p pizzlydb-cli --target "${TARGET}"
+          fi
+
+          bin="target/${TARGET}/release/pizzlydb"
+          if [ ! -f "${bin}" ] || [ ! -x "${bin}" ]; then
+            printf 'release binary not found\n' >&2
+            exit 1
+          fi
+          if [ ! -f LICENSE ]; then
+            printf 'LICENSE not found\n' >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          asset="pizzlydb_${version}_${TARGET}.tar.gz"
+          stage="$(mktemp -d)"
+          trap 'rm -rf "${stage}"' EXIT
+          cp "${bin}" "${stage}/pizzlydb"
+          cp LICENSE "${stage}/LICENSE"
+          chmod 0755 "${stage}/pizzlydb"
+          if command -v file >/dev/null 2>&1; then
+            file "${stage}/pizzlydb"
+          fi
+          mkdir -p dist
+          tar -C "${stage}" -czf "dist/${asset}" pizzlydb LICENSE
+          rm -rf "${stage}"
+          trap - EXIT
+
+          (
+            cd dist
+            sha256sum "${asset}" > "${asset}.sha256"
+          )
+          cat "dist/${asset}.sha256"
+          printf 'ASSET_PATH=dist/%s\n' "${asset}" >> "${GITHUB_ENV}"
+          printf 'CHECKSUM_PATH=dist/%s.sha256\n' "${asset}" >> "${GITHUB_ENV}"
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ env.ASSET_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "${RELEASE_TAG}" in
+            *[!A-Za-z0-9._-]*|"")
+              printf 'refusing unexpected release tag\n' >&2
+              exit 1
+              ;;
+            v[0-9]*.[0-9]*.[0-9]*)
+              ;;
+            *)
+              printf 'refusing unexpected release tag\n' >&2
+              exit 1
+              ;;
+          esac
+          archive="${ASSET_PATH#dist/}"
+          checksum="${CHECKSUM_PATH#dist/}"
+          case "${ASSET_PATH}" in
+            "dist/${archive}")
+              ;;
+            *)
+              printf 'refusing unexpected archive path\n' >&2
+              exit 1
+              ;;
+          esac
+          case "${CHECKSUM_PATH}" in
+            "dist/${checksum}")
+              ;;
+            *)
+              printf 'refusing unexpected checksum path\n' >&2
+              exit 1
+              ;;
+          esac
+          case "${archive}" in
+            *[!A-Za-z0-9._-]*|*..*)
+              printf 'refusing unexpected archive path\n' >&2
+              exit 1
+              ;;
+            pizzlydb_*.tar.gz)
+              ;;
+            *)
+              printf 'refusing unexpected archive path\n' >&2
+              exit 1
+              ;;
+          esac
+          case "${checksum}" in
+            "${archive}.sha256")
+              ;;
+            *)
+              printf 'refusing unexpected checksum path\n' >&2
+              exit 1
+              ;;
+          esac
+          if [ ! -f "${ASSET_PATH}" ] || [ ! -f "${CHECKSUM_PATH}" ]; then
+            printf 'release assets not found\n' >&2
+            exit 1
+          fi
+          attempt=1
+          until gh release upload "${RELEASE_TAG}" "${ASSET_PATH}" "${CHECKSUM_PATH}" --clobber; do
+            if [ "${attempt}" -ge 5 ]; then
+              printf 'release upload failed\n' >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+            attempt=$((attempt + 1))
+          done

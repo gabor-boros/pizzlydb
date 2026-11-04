@@ -1,0 +1,14 @@
+exit-code: 1
+severity:
+  - HIGH
+  - CRITICAL
+scan:
+  scanners:
+    - vuln
+    - secret
+    - misconfig
+  skip-dirs:
+    - target
+    - .git
+vulnerability:
+  ignore-unfixed: true

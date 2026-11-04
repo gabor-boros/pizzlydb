@@ -1,0 +1,22 @@
+[package]
+name = "pizzlydb-incremental"
+description = "Signed-delta operators, arrangements, and maintained-state checkpoints."
+categories = ["database-implementations"]
+keywords = ["pizzlydb", "database"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+
+[dependencies]
+pizzlydb-core = { path = "../pizzlydb-core" }
+pizzlydb-query = { path = "../pizzlydb-query" }
+pizzlydb-txn = { path = "../pizzlydb-txn" }
+
+[lints]
+workspace = true

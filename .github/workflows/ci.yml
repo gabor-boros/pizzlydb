@@ -1,0 +1,211 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+    permissions:
+      contents: read
+      actions: write # rust-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+    permissions:
+      contents: read
+      actions: write # rust-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+      - name: Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --locked clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+    permissions:
+      contents: read
+      actions: write # rust-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+        with:
+          tools: cargo-nextest
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --locked nextest run --workspace --no-tests=pass
+      - name: Doctests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --locked test --workspace --doc
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+    permissions:
+      contents: read
+      actions: write # rust-cache and SBOM artifact upload
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+        with:
+          tools: cargo-deny,cargo-audit,cargo-cyclonedx
+      - name: Supply chain
+        uses: ./.github/actions/supply-chain # zizmor: ignore[self-repository]
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom/
+          if-no-files-found: error
+
+  commitlint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read # commitlint reads pull request commits
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Commitlint
+        uses: wagoid/commitlint-github-action@b948419dd99f3fd78a6548d48f94e3df7f6bf3ed # v6.2.1
+        with:
+          configFile: .commitlintrc.json
+
+  reuse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: REUSE
+        uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5 # v6.0.0
+
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          advanced-security: false
+          annotations: true
+          online-audits: false
+          persona: regular
+          version: "1.31.1"
+      - name: actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="1.7.12"
+          case "$(uname -m)" in
+            x86_64)
+              asset="actionlint_${version}_linux_amd64.tar.gz"
+              expected="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+              ;;
+            aarch64|arm64)
+              asset="actionlint_${version}_linux_arm64.tar.gz"
+              expected="325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"
+              ;;
+            *)
+              printf 'unsupported architecture: %s\n' "$(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          trap 'rm -f actionlint actionlint.tar.gz' EXIT
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/${asset}"
+          echo "${expected}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color

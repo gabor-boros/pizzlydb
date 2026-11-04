@@ -1,0 +1,20 @@
+[package]
+name = "pizzlydb-auth"
+description = "Identity, permissions, and policy epochs."
+categories = ["database-implementations"]
+keywords = ["pizzlydb", "database"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+
+[dependencies]
+pizzlydb-core = { path = "../pizzlydb-core" }
+
+[lints]
+workspace = true

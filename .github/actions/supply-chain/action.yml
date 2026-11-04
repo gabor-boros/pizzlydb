@@ -1,0 +1,89 @@
+name: Supply chain
+description: Run cargo-deny, cargo-audit, and collect CycloneDX JSON SBOMs.
+
+inputs:
+  sbom-dir:
+    description: Directory for collected CycloneDX JSON BOMs.
+    required: false
+    default: sbom
+
+runs:
+  using: composite
+  steps:
+    - name: Check licenses, bans, and sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo deny check licenses bans sources
+
+    - name: Audit dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo audit --deny unsound --deny yanked
+
+    - name: Generate CycloneDX SBOMs
+      shell: bash
+      env:
+        SBOM_DIR: ${{ inputs.sbom-dir }}
+      run: |
+        set -euo pipefail
+        case "${SBOM_DIR}" in
+          ""|/*|..|../*|*/..|*/../*|*[!A-Za-z0-9._/-]*)
+            printf 'sbom directory must be a relative path\n' >&2
+            exit 1
+            ;;
+        esac
+
+        mkdir -p "${SBOM_DIR}"
+        cargo cyclonedx --format json
+
+        shopt -s nullglob
+        count=0
+        while IFS= read -r -d '' manifest; do
+          dir="$(dirname "${manifest}")"
+          rel="${dir#./}"
+          case "${rel}" in
+            "${SBOM_DIR}"|"${SBOM_DIR}"/*)
+              continue
+              ;;
+          esac
+          if [ "${rel}" = "." ]; then
+            stem="workspace"
+          else
+            stem="$(printf '%s' "${rel}" | tr '/' '-')"
+          fi
+
+          candidates=()
+          if [ -f "${dir}/bom.json" ]; then
+            candidates+=("${dir}/bom.json")
+          fi
+          for extra in "${dir}/"*.cdx.json; do
+            candidates+=("${extra}")
+          done
+          if [ "${#candidates[@]}" -eq 0 ]; then
+            continue
+          fi
+
+          for candidate in "${candidates[@]}"; do
+            base="$(basename "${candidate}")"
+            if [ "${base}" = "bom.json" ]; then
+              dest="${SBOM_DIR}/${stem}.cdx.json"
+            else
+              file_stem="${base%.cdx.json}"
+              dest="${SBOM_DIR}/${stem}-${file_stem}.cdx.json"
+            fi
+            if [ -e "${dest}" ]; then
+              printf 'duplicate SBOM destination: %s\n' "${dest}" >&2
+              exit 1
+            fi
+            mv "${candidate}" "${dest}"
+            printf 'collected %s\n' "${dest}"
+            count=$((count + 1))
+          done
+        done < <(find . -name Cargo.toml -not -path '*/target/*' -not -path '*/.git/*' -print0)
+
+        if [ "${count}" -eq 0 ]; then
+          printf 'cargo cyclonedx produced no JSON BOMs\n' >&2
+          exit 1
+        fi

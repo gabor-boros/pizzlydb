@@ -1,0 +1,40 @@
+# License, ban, and source policy.
+# Advisories are checked with cargo audit, not cargo deny.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Apache-2.0 WITH LLVM-exception",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates are unpublished. Path dependencies between them have no
+# version requirement. Registry dependencies with `version = "*"` stay denied.
+allow-wildcard-paths = true
+
+# Major splits pulled in by pinned upstream crates. Skipping the older side
+# keeps a new duplicate visible.
+skip = [
+    { crate = "getrandom@^0.2", reason = "rand 0.8 via openraft; cc and jobserver use getrandom 0.4" },
+    { crate = "shlex@^1", reason = "bindgen uses shlex 1; cc uses shlex 2" },
+    { crate = "syn@^2", reason = "older proc-macros stay on syn 2; clap, serde, and thiserror 2 use syn 3" },
+    { crate = "thiserror@^1", reason = "openraft 0.9 depends on thiserror 1; workspace crates use thiserror 2" },
+    { crate = "thiserror-impl@^1", reason = "proc-macro companion of the thiserror 1 required by openraft" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

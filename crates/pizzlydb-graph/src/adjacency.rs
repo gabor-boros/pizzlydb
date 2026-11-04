@@ -1,0 +1,1 @@
+//! Forward and reverse adjacency.

@@ -1,0 +1,20 @@
+[package]
+name = "pizzlydb-protocol"
+description = "Versioned native protocol types and canonical error names."
+categories = ["database-implementations"]
+keywords = ["pizzlydb", "database"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+
+[dependencies]
+pizzlydb-core = { path = "../pizzlydb-core" }
+
+[lints]
+workspace = true
