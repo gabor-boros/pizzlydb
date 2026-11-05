@@ -6,8 +6,8 @@
 
 mod backup;
 mod btree;
-// The pager and the write-ahead log are not implemented yet, so these modules
-// have no uses outside their tests.
+// The pager is not implemented yet. These modules are used by the log, the
+// superblock, and tests.
 #[cfg_attr(not(test), allow(dead_code))]
 mod checksum;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -21,6 +21,8 @@ mod page;
 mod pager;
 mod salvage;
 mod space;
+// The pager does not call the superblock yet.
+#[cfg_attr(not(test), allow(dead_code))]
 mod superblock;
 mod verify;
 // The page engine is the caller. It is not implemented yet, so these modules
@@ -32,4 +34,6 @@ mod vfs_memory;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod vfs_posix;
+// The pager does not call the log yet.
+#[cfg_attr(not(test), allow(dead_code))]
 mod wal;
