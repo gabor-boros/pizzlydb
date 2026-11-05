@@ -13,6 +13,10 @@ homepage = "https://github.com/gabor-boros/pizzlydb"
 readme = "README.md"
 rust-version = "1.88"
 
+[workspace.dependencies]
+tempfile = "3.27.0"
+thiserror = "2"
+
 # Max runtime performance for shipped binaries. Compile time is secondary.
 # Native CPU tuning stays off (WI-EP02-01); builds stay portable across the
 # declared target triples.

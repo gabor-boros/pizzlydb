@@ -2,11 +2,11 @@
 
 In-house page engine and the byte-oriented `StorageEngine` boundary.
 
-This crate is a skeleton. The sections below describe the intended contract. The crate compiles and exports no public API.
+The virtual file system is implemented and crate-private. The pager, write-ahead log, page allocator, B-tree, and `StorageEngine` boundary are not implemented. The crate exports no public API.
 
 ## Purpose
 
-`pizzlydb-storage` will persist opaque bytes. The page engine includes:
+`pizzlydb-storage` persists opaque bytes. The page engine includes:
 
 - a virtual file system (VFS), with memory and POSIX backends
 - a pager and physical snapshots

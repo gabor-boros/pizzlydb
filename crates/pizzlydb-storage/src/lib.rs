@@ -17,7 +17,13 @@ mod salvage;
 mod space;
 mod superblock;
 mod verify;
+// The page engine is the caller. It is not implemented yet, so these modules
+// have no uses outside their tests.
+#[cfg_attr(not(test), allow(dead_code))]
 mod vfs;
+#[cfg_attr(not(test), allow(dead_code))]
 mod vfs_memory;
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
 mod vfs_posix;
 mod wal;

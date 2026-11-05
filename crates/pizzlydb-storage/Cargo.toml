@@ -13,5 +13,11 @@ homepage.workspace = true
 readme = "README.md"
 rust-version.workspace = true
 
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
