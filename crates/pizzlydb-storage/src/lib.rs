@@ -6,11 +6,17 @@
 
 mod backup;
 mod btree;
+// The pager and the write-ahead log are not implemented yet, so these modules
+// have no uses outside their tests.
+#[cfg_attr(not(test), allow(dead_code))]
+mod checksum;
+#[cfg_attr(not(test), allow(dead_code))]
 mod codec;
 mod engine;
 mod inspect;
 mod maintain;
 mod meta;
+#[cfg_attr(not(test), allow(dead_code))]
 mod page;
 mod pager;
 mod salvage;
