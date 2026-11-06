@@ -5,6 +5,8 @@
 //! records, MVCC, or the logical commit log.
 
 mod backup;
+// The storage engine does not call the tree yet.
+#[cfg_attr(not(test), allow(dead_code))]
 mod btree;
 // The engine does not call the pager yet, so a non-test build does not see
 // these uses.
