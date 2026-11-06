@@ -161,8 +161,8 @@ impl From<VfsError> for WalError {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use pizzlydb_storage::wal::Durability;
+/// ```
+/// use pizzlydb_storage::Durability;
 ///
 /// let durable = Durability::Full;
 /// let volatile = Durability::None;
@@ -723,6 +723,87 @@ impl<F: VfsFile> Wal<F> {
     #[must_use]
     pub fn pages(&self) -> &[CommittedPage] {
         &self.pages
+    }
+
+    /// Raise the recorded commit floor without writing a frame.
+    ///
+    /// An empty log reopened after checkpoint uses the superblock checkpoint
+    /// sequence as this floor. A lower value is ignored. The file bytes are
+    /// unchanged.
+    pub(crate) fn adopt_floor(&mut self, lsn: Lsn) {
+        if lsn.as_u64() > self.durable_lsn.as_u64() {
+            self.durable_lsn = lsn;
+        }
+    }
+
+    /// Drop published images at or below `horizon` and rewrite the file.
+    ///
+    /// Images above `horizon` are written again as complete commits. The
+    /// recorded commit floor does not move backward. Pending images make the
+    /// call fail and leave the file unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Corrupt`] when a commit is still pending, and
+    /// [`WalError::Io`] when the rewrite or its sync fails.
+    pub(crate) fn prune(&mut self, horizon: Lsn) -> Result<(), WalError> {
+        if !self.pending.is_empty() {
+            return Err(WalError::Corrupt);
+        }
+
+        let kept: Vec<CommittedPage> = self
+            .pages
+            .iter()
+            .filter(|page| page.lsn.as_u64() > horizon.as_u64())
+            .cloned()
+            .collect();
+
+        let header = encode_header(&self.file_id)?;
+        self.file.write_all(0, &header)?;
+
+        let mut offset = header_end()?;
+        let mut index = 0;
+        while index < kept.len() {
+            let txn_id = kept[index].txn_id;
+            let lsn = kept[index].lsn;
+            let start = index;
+            while index < kept.len() && kept[index].txn_id == txn_id && kept[index].lsn == lsn {
+                index += 1;
+            }
+
+            for page in &kept[start..index] {
+                let payload = image_payload(page.txn_id, page.page_id, page.lsn, &page.image)?;
+                let frame = encode_frame(KIND_PAGE_IMAGE, &payload)?;
+                self.file.write_all(offset, &frame)?;
+                offset = add_len(offset, frame.len())?;
+            }
+
+            let count = u64::try_from(index - start).map_err(|_| WalError::Corrupt)?;
+            let payload = commit_payload(txn_id, lsn, count)?;
+            let frame = encode_frame(KIND_COMMIT, &payload)?;
+            self.file.write_all(offset, &frame)?;
+            offset = add_len(offset, frame.len())?;
+        }
+
+        let tail = self.allocated_end.max(self.append_offset);
+        if tail > offset {
+            self.zero_range(offset, tail)?;
+        }
+
+        self.file.sync()?;
+        self.append_offset = offset;
+        self.synced_offset = offset;
+        self.allocated_end = tail.max(offset);
+        self.pages = kept;
+        Ok(())
+    }
+
+    /// Discard bytes written after the last successful sync.
+    ///
+    /// Pending images in that tail are dropped. Published images stay recorded.
+    /// The visible tail is overwritten with zeros, and those zeros are not synced.
+    pub(crate) fn abandon_unsynced(&mut self) {
+        self.discard_unsynced();
     }
 
     fn prepare_image(
@@ -1735,6 +1816,52 @@ mod tests {
         assert_eq!(wal.durable_lsn(), Lsn::new(0));
         wal.commit(Durability::None, 1, Lsn::new(1), 1).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
+    }
+
+    #[test]
+    fn prune_drops_checkpointed_images_and_keeps_the_floor() {
+        let vfs = MemoryVfs::new();
+        let path = Path::new("prune.wal");
+        let file = vfs
+            .open(path, FileRole::Wal, &OpenOptions::new().create(true))
+            .unwrap();
+        let mut wal = Wal::create(file, FILE_ID).unwrap();
+        let first = leaf(4, 1, 0x11);
+        let second = leaf(5, 2, 0x22);
+        wal.append_page_image(1, PageId::new(4), Lsn::new(1), &first)
+            .unwrap();
+        wal.commit(Durability::Full, 1, Lsn::new(1), 1).unwrap();
+        wal.append_page_image(2, PageId::new(5), Lsn::new(2), &second)
+            .unwrap();
+        wal.commit(Durability::Full, 2, Lsn::new(2), 1).unwrap();
+
+        wal.prune(Lsn::new(1)).unwrap();
+
+        assert_eq!(wal.durable_lsn(), Lsn::new(2));
+        assert_eq!(wal.pages().len(), 1);
+        assert_eq!(wal.pages()[0].page_id(), PageId::new(5));
+        drop(wal);
+
+        let bytes = snapshot(&vfs, path);
+        let recovered = recover(&bytes).unwrap();
+        assert_eq!(recovered.durable_lsn(), Lsn::new(2));
+        assert_eq!(recovered.pages().len(), 1);
+        assert_eq!(recovered.pages()[0].image(), &second);
+
+        let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
+        let mut reopened = Wal::open(file, FILE_ID).unwrap();
+        reopened.adopt_floor(Lsn::new(1));
+        assert_eq!(reopened.durable_lsn(), Lsn::new(2));
+        reopened.prune(Lsn::new(2)).unwrap();
+        assert_eq!(reopened.durable_lsn(), Lsn::new(2));
+        assert!(reopened.pages().is_empty());
+        drop(reopened);
+
+        let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
+        let mut adopted = Wal::open(file, FILE_ID).unwrap();
+        assert_eq!(adopted.durable_lsn(), Lsn::new(0));
+        adopted.adopt_floor(Lsn::new(2));
+        assert_eq!(adopted.durable_lsn(), Lsn::new(2));
     }
 
     #[test]

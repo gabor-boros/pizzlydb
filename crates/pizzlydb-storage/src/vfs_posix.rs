@@ -32,7 +32,7 @@ use crate::vfs::{
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use pizzlydb_storage::vfs::{FileRole, OpenOptions, PosixVfs, Vfs, VfsFile};
 ///
 /// let dir = tempfile::tempdir().unwrap();

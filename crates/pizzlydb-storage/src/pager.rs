@@ -748,6 +748,165 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
 
         Ok(())
     }
+
+    /// Last published commit sequence.
+    #[must_use]
+    pub(crate) fn committed_lsn(&self) -> Lsn {
+        self.state.borrow().committed_lsn
+    }
+
+    /// Oldest registered snapshot, if any guard is alive.
+    #[must_use]
+    pub(crate) fn oldest_snapshot(&self) -> Option<Lsn> {
+        self.state
+            .borrow()
+            .snapshots
+            .iter()
+            .map(|(_, lsn)| *lsn)
+            .min()
+    }
+
+    /// Page ids that have a published log image at or before `snapshot`.
+    #[must_use]
+    pub(crate) fn wal_page_ids(&self, snapshot: Lsn) -> Vec<PageId> {
+        let state = self.state.borrow();
+        let mut ids = Vec::new();
+        for page in state.wal.pages() {
+            if page.lsn() <= snapshot && !ids.contains(&page.page_id()) {
+                ids.push(page.page_id());
+            }
+        }
+        ids
+    }
+
+    /// Publish every image in one log transaction.
+    ///
+    /// `pages` must be non-empty. Each image is already sealed at the next
+    /// commit sequence. [`Durability::Full`] syncs before that sequence is
+    /// recorded. [`Durability::None`] records it without syncing. A failed
+    /// append discards the unsynced tail. A failed sync does the same inside
+    /// [`Wal::commit`](crate::wal::Wal::commit). The recorded sequence stays
+    /// unchanged on either failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Corrupt`] when `pages` is empty or the sequence
+    /// cannot advance, and [`PagerError::Wal`] when the log rejects the batch.
+    pub(crate) fn commit_pages(
+        &self,
+        pages: &[(PageId, [u8; PAGE_SIZE])],
+        durability: Durability,
+    ) -> Result<Lsn, PagerError> {
+        if pages.is_empty() {
+            return Err(PagerError::Corrupt);
+        }
+
+        let mut state = self.state.borrow_mut();
+        let new_lsn = next_lsn(state.committed_lsn);
+        if new_lsn.as_u64() == state.committed_lsn.as_u64() {
+            return Err(PagerError::Corrupt);
+        }
+
+        let txn_id = state.next_txn_id;
+        if txn_id == 0 {
+            return Err(PagerError::Corrupt);
+        }
+
+        let page_count = u64::try_from(pages.len()).map_err(|_| PagerError::Corrupt)?;
+        for (page_id, image) in pages {
+            if let Err(err) = state
+                .wal
+                .append_page_image(txn_id, *page_id, new_lsn, image)
+            {
+                state.wal.abandon_unsynced();
+                return Err(err.into());
+            }
+        }
+
+        state.wal.commit(durability, txn_id, new_lsn, page_count)?;
+        state.committed_lsn = new_lsn;
+        state.next_txn_id = state.next_txn_id.saturating_add(1);
+        Ok(new_lsn)
+    }
+
+    /// Sync the main file as it stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Io`] when the handle's sync fails.
+    pub(crate) fn sync_main(&self) -> Result<(), PagerError> {
+        self.state.borrow_mut().main.sync()?;
+        Ok(())
+    }
+
+    /// Sync the log without publishing a commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Wal`] when the log sync fails. The recorded
+    /// sequence is unchanged.
+    pub(crate) fn sync_wal(&self) -> Result<(), PagerError> {
+        self.state.borrow_mut().wal.sync()?;
+        Ok(())
+    }
+
+    /// Write `image` to the main file at `page_id` and drop an unpinned cache frame.
+    ///
+    /// This does not sync the file and does not append a log record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Corrupt`] when `image` is not one page or the
+    /// offset overflows, and [`PagerError::Io`] when the write fails.
+    pub(crate) fn write_page(&self, page_id: PageId, image: &[u8]) -> Result<(), PagerError> {
+        if image.len() != PAGE_SIZE {
+            return Err(PagerError::Corrupt);
+        }
+
+        let offset = page_offset(page_id)?;
+        let mut state = self.state.borrow_mut();
+        state.main.write_all(offset, image)?;
+        bump(&mut state.stats.write_io);
+
+        for frame in &mut state.meta {
+            if frame.occupied && frame.page_id == page_id && frame.pin_count == 0 {
+                *frame = FrameMeta::empty();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply the superblock checkpoint sequence when the log has no commits.
+    ///
+    /// A log whose recorded sequence is below `checkpoint` is [`PagerError::Corrupt`].
+    pub(crate) fn recover_floor(&self, checkpoint: Lsn) -> Result<(), PagerError> {
+        let mut state = self.state.borrow_mut();
+        let durable = state.wal.durable_lsn();
+        if durable.as_u64() == 0 {
+            state.wal.adopt_floor(checkpoint);
+            if checkpoint.as_u64() > state.committed_lsn.as_u64() {
+                state.committed_lsn = checkpoint;
+            }
+            return Ok(());
+        }
+
+        if durable < checkpoint {
+            return Err(PagerError::Corrupt);
+        }
+
+        Ok(())
+    }
+
+    /// Remove log images at or below `horizon`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Wal`] when the rewrite fails.
+    pub(crate) fn prune_wal(&self, horizon: Lsn) -> Result<(), PagerError> {
+        self.state.borrow_mut().wal.prune(horizon)?;
+        Ok(())
+    }
 }
 
 /// A pinned frame.

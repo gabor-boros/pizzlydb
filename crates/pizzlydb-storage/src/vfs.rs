@@ -24,6 +24,10 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
+pub use crate::vfs_memory::MemoryVfs;
+#[cfg(unix)]
+pub use crate::vfs_posix::PosixVfs;
+
 /// Failure from a [`Vfs`] operation.
 ///
 /// Platform error codes stay on [`VfsError::Io::source`] for logs and are not
@@ -107,7 +111,7 @@ fn checked_offset(offset: u64, advanced: usize) -> Result<u64, VfsError> {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use std::path::Path;
 ///
 /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
@@ -140,7 +144,7 @@ pub enum FileRole {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use pizzlydb_storage::vfs::OpenOptions;
 ///
 /// let options = OpenOptions::new().create(true).exclusive(true);
@@ -219,7 +223,7 @@ impl OpenOptions {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use std::path::Path;
 ///
 /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
@@ -324,6 +328,34 @@ pub trait VfsFile {
     /// Returns [`VfsError::Io`] when the length cannot be read.
     fn len(&self) -> Result<u64, VfsError>;
 
+    /// Whether [`Self::len`] is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::Io`] when the length cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let file = vfs
+    ///     .open(
+    ///         Path::new("empty"),
+    ///         FileRole::Main,
+    ///         &OpenOptions::new().create(true),
+    ///     )
+    ///     .unwrap();
+    ///
+    /// assert!(file.is_empty().unwrap());
+    /// ```
+    fn is_empty(&self) -> Result<bool, VfsError> {
+        Ok(self.len()? == 0)
+    }
+
     /// Sync, then release the descriptor.
     ///
     /// The descriptor is released even when [`Self::sync`] fails. The returned
@@ -336,7 +368,7 @@ pub trait VfsFile {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
     ///
     /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
@@ -373,7 +405,7 @@ pub trait VfsFile {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
     ///
     /// use pizzlydb_storage::vfs::{
@@ -437,7 +469,7 @@ pub trait VfsFile {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
     ///
     /// use pizzlydb_storage::vfs::{
@@ -494,7 +526,7 @@ pub trait VfsFile {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use pizzlydb_storage::vfs::{Fault, FaultKind};
 ///
 /// let fault = Fault {
@@ -515,7 +547,7 @@ pub struct Fault {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use pizzlydb_storage::vfs::FaultKind;
 ///
 /// let torn = FaultKind::Torn { prefix: 1 };
@@ -581,7 +613,7 @@ fn take_fault(state: &Rc<RefCell<FaultState>>) -> Result<Option<FaultKind>, VfsE
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use std::path::Path;
 ///
 /// use pizzlydb_storage::vfs::{

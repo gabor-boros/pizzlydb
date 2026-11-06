@@ -1,46 +1,50 @@
-//! In-house page engine.
+//! Ordered byte keys with snapshot reads and atomic batches.
 //!
-//! This crate is a VFS, pager, WAL, page allocator, B-tree, checksums, and
-//! superblock. It exposes byte-oriented persistence and does not define graph
-//! records, MVCC, or the logical commit log.
+//! [`Storage`] creates and opens a database. [`Storage::snapshot`] reads one
+//! committed sequence. [`Storage::begin_write`] stages puts and deletes.
+//! [`WriteBatch::commit`] with [`Durability::Full`] returns after the commit
+//! record is synced. Dropping a batch without `commit` publishes nothing.
+//! [`Storage::checkpoint`] copies committed bytes into the main file.
+//!
+//! One write batch may be open. A second [`Storage::begin_write`] returns
+//! [`StorageError::Busy`].
+//!
+//! Callers pass a [`Vfs`]. [`MemoryVfs`] keeps bytes in memory. On Unix,
+//! [`PosixVfs`] uses the filesystem. The log path is the database path with
+//! `-wal` appended.
+//!
+//! This crate does not define higher-level records, multi-version transactions,
+//! or a logical commit log, and it does not depend on `pizzlydb-core`.
 
 mod backup;
-// The storage engine does not call the tree yet.
 #[cfg_attr(not(test), allow(dead_code))]
 mod btree;
-// The engine does not call the pager yet, so a non-test build does not see
-// these uses.
 #[cfg_attr(not(test), allow(dead_code))]
 mod checksum;
-#[cfg_attr(not(test), allow(dead_code))]
 mod codec;
 mod engine;
 mod inspect;
 mod maintain;
 mod meta;
-#[cfg_attr(not(test), allow(dead_code))]
 mod page;
-// The storage engine does not call the pager yet.
 #[cfg_attr(not(test), allow(dead_code))]
 mod pager;
 mod salvage;
-// The engine does not call the allocator yet.
 #[cfg_attr(not(test), allow(dead_code))]
 mod space;
-// The pager does not call the superblock.
 #[cfg_attr(not(test), allow(dead_code))]
 mod superblock;
 mod verify;
-// The engine does not call the pager yet, so a non-test build does not see
-// these uses.
-#[cfg_attr(not(test), allow(dead_code))]
-mod vfs;
-#[cfg_attr(not(test), allow(dead_code))]
-mod vfs_memory;
+pub mod vfs;
+pub mod vfs_memory;
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))]
-mod vfs_posix;
-// The engine does not call the pager yet, so a non-test build does not see
-// these uses.
+pub mod vfs_posix;
 #[cfg_attr(not(test), allow(dead_code))]
 mod wal;
+
+pub use engine::{Durability, ReadView, Scan, Storage, StorageEngine, StorageError, WriteBatch};
+pub use page::Lsn;
+pub use vfs::{Fault, FaultInjecting, FaultKind, FileRole, OpenOptions, Vfs, VfsError, VfsFile};
+pub use vfs_memory::MemoryVfs;
+#[cfg(unix)]
+pub use vfs_posix::PosixVfs;

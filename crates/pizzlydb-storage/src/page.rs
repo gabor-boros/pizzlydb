@@ -33,12 +33,15 @@
 //! - `6`: [`PageKind::BTreeLeaf`]
 //! - `7`: [`PageKind::Overflow`]
 //! - `8`: [`PageKind::RetireSpill`]
+//! - `9`: [`PageKind::State`]
 //!
 //! Pages 0 and 1 are the superblock copies. [`ALLOCATOR_PAGE_ID`] is the
 //! allocator header. [`BITMAP_PAGE_ID`] is the allocation bitmap.
 //! [`FIRST_DATA_PAGE_ID`] is the first id available for a data page. Those
 //! ids stay allocated for the life of the file. Free-space hints are stored
 //! in the allocator header. No page id is reserved for [`PageKind::FreeSpaceMap`].
+//! [`PageKind::State`] is the ordered-map root record. The engine allocates it
+//! once at [`FIRST_DATA_PAGE_ID`].
 
 use crate::checksum::Checksum;
 use crate::codec::{CodecError, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
@@ -106,12 +109,15 @@ impl PageId {
     }
 }
 
-/// Log sequence number stored in a page header.
+/// Sequence number assigned to a committed batch.
+///
+/// Zero is the sequence before any commit. A later batch receives a greater
+/// value.
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use pizzlydb_storage::page::Lsn;
+/// ```
+/// use pizzlydb_storage::Lsn;
 ///
 /// let lsn = Lsn::new(9);
 /// assert_eq!(lsn.as_u64(), 9);
@@ -193,7 +199,7 @@ pub const FIRST_DATA_PAGE_ID: PageId = PageId::new(4);
 ///
 /// assert_eq!(PageKind::try_from(6), Ok(PageKind::BTreeLeaf));
 /// assert_eq!(PageKind::BTreeLeaf.as_u16(), 6);
-/// assert_eq!(PageKind::try_from(9), Err(CodecError::BadKind));
+/// assert_eq!(PageKind::try_from(10), Err(CodecError::BadKind));
 /// ```
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -219,6 +225,11 @@ pub enum PageKind {
     Overflow = 7,
     /// Retire records that do not fit in the allocator header.
     RetireSpill = 8,
+    /// Root and high-water record for the ordered map.
+    ///
+    /// The engine writes this kind at [`FIRST_DATA_PAGE_ID`]. Keys are stored on
+    /// other pages.
+    State = 9,
 }
 
 impl PageKind {
@@ -243,6 +254,7 @@ impl TryFrom<u16> for PageKind {
             6 => Self::BTreeLeaf,
             7 => Self::Overflow,
             8 => Self::RetireSpill,
+            9 => Self::State,
             _ => return Err(CodecError::BadKind),
         })
     }
@@ -474,7 +486,7 @@ mod tests {
     fn example_page_kind() {
         assert_eq!(PageKind::try_from(6), Ok(PageKind::BTreeLeaf));
         assert_eq!(PageKind::BTreeLeaf.as_u16(), 6);
-        assert_eq!(PageKind::try_from(9), Err(CodecError::BadKind));
+        assert_eq!(PageKind::try_from(10), Err(CodecError::BadKind));
     }
 
     #[test]
@@ -488,6 +500,7 @@ mod tests {
         assert_eq!(PageKind::BTreeLeaf.as_u16(), 6);
         assert_eq!(PageKind::Overflow.as_u16(), 7);
         assert_eq!(PageKind::RetireSpill.as_u16(), 8);
+        assert_eq!(PageKind::State.as_u16(), 9);
         assert_eq!(PageKind::try_from(0xFFFF), Err(CodecError::BadKind));
     }
 
@@ -609,7 +622,7 @@ mod tests {
         );
 
         let mut page = sealed_page();
-        put_u16(&mut page, KIND_OFFSET, 9).unwrap();
+        put_u16(&mut page, KIND_OFFSET, 10).unwrap();
         seal(&mut page).unwrap();
         assert_eq!(PageHeader::decode(&page), Err(CodecError::BadKind));
     }

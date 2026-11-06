@@ -53,7 +53,7 @@ struct MemoryState {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use std::path::Path;
 ///
 /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
@@ -115,7 +115,7 @@ impl MemoryVfs {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
     ///
     /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
@@ -172,7 +172,7 @@ impl MemoryVfs {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
     ///
     /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs};
@@ -213,7 +213,7 @@ impl MemoryVfs {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```
     /// use std::path::Path;
     ///
     /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};

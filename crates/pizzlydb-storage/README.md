@@ -1,29 +1,18 @@
 # pizzlydb-storage
 
-In-house page engine and the byte-oriented `StorageEngine` boundary.
+Byte-oriented storage for pizzlydb.
 
-The virtual file system, page headers, CRC-32C checksums, write-ahead log, superblock, pager, and page allocator are implemented and crate-private. The B-tree and `StorageEngine` boundary are not implemented. The crate exports no public API.
+`Storage` creates and opens a database, reads a snapshot, and commits a batch of puts and deletes. `Durability::Full` syncs the commit record before it returns. Dropping a batch without `commit` publishes nothing. `checkpoint` copies committed bytes into the main file and advances the recorded checkpoint.
 
-## Purpose
+Callers pass a `Vfs`. `MemoryVfs` and, on Unix, `PosixVfs` are included. The log path is the database path with `-wal` appended.
 
-`pizzlydb-storage` persists opaque bytes. The page engine includes:
+One write batch may be open. A second `begin_write` returns `StorageError::Busy`.
 
-- a virtual file system (VFS), with memory and POSIX backends
-- a pager and physical snapshots
-- a write-ahead log (WAL) and a durability barrier
-- a page allocator, checksums, and a superblock
-- a B-tree with opaque byte keys
-- backup, restore, verification, inspection, salvage, and page maintenance
+The index, the log record layout, and the file format stay inside this crate. Higher-level records, multi-version transactions, and the logical commit log belong to other crates. This crate does not depend on `pizzlydb-core`.
 
-Callers will use `StorageEngine` for atomic synced batches, ordered scans, point reads, snapshots, checkpoints, and durability settings. Page types, WAL frames, and B-tree layout stay in this crate.
+## Public types
 
-Graph records, multi-version concurrency control (MVCC), and the logical commit log belong to `pizzlydb-graph` and `pizzlydb-txn`. This crate does not depend on `pizzlydb-core`.
-
-## Modules
-
-`checksum`, `codec`, `page`, `superblock`, `meta`, `vfs`, `vfs_memory`, `vfs_posix`, `pager`, `space`, `wal`, `btree`, `maintain`, `backup`, `verify`, `inspect`, `salvage`, and `engine`.
-
-`checksum` is the CRC-32C used by page images and the write-ahead log. `codec` is the little-endian integer encoding for those records. `page` is the fixed-size image and its header. `space` allocates page ids with an extent bitmap. The bitmap is the authority. A retire entry keeps its bit set until `reclaim` runs with a horizon strictly above that entry's LSN. Free-space hints are not authority. The header stores 64 retire entries and spills the rest onto retire-spill pages. `wal` is the physical page-image log, not the logical commit log. `pager` caches a fixed number of page images keyed by page id and LSN. A pin releases its frame on drop. A snapshot registration releases on drop. Resolution returns the newest committed image at or before the snapshot LSN. `superblock` stores two checksummed copies of the file identity, format version, generation, checkpoint LSN, logical page count, and the allocator, free-space map, and B-tree root page ids. `meta` does not store node or edge counters. The bitmap page id is in the allocator header. The B-tree root page id is in the superblock.
+`Storage`, `StorageEngine`, `ReadView`, `WriteBatch`, `Scan`, `StorageError`, `Durability`, `Lsn`, and the `Vfs` traits and backends.
 
 ## License
 
