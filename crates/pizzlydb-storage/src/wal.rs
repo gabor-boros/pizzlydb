@@ -676,7 +676,7 @@ impl<F: VfsFile> Wal<F> {
     /// use pizzlydb_storage::wal::Wal;
     ///
     /// let vfs = MemoryVfs::new();
-    /// let file = vfs.open(.open(
+    /// let file = vfs.open(
     ///     Path::new("db.wal"),
     ///     FileRole::Wal,
     ///     &OpenOptions::new().create(true),
