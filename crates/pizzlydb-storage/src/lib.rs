@@ -22,6 +22,8 @@ mod page;
 #[cfg_attr(not(test), allow(dead_code))]
 mod pager;
 mod salvage;
+// The engine does not call the allocator yet.
+#[cfg_attr(not(test), allow(dead_code))]
 mod space;
 // The pager does not call the superblock.
 #[cfg_attr(not(test), allow(dead_code))]

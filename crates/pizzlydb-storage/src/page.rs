@@ -33,6 +33,12 @@
 //! - `6`: [`PageKind::BTreeLeaf`]
 //! - `7`: [`PageKind::Overflow`]
 //! - `8`: [`PageKind::RetireSpill`]
+//!
+//! Pages 0 and 1 are the superblock copies. [`ALLOCATOR_PAGE_ID`] is the
+//! allocator header. [`BITMAP_PAGE_ID`] is the allocation bitmap.
+//! [`FIRST_DATA_PAGE_ID`] is the first id available for a data page. Those
+//! ids stay allocated for the life of the file. Free-space hints are stored
+//! in the allocator header. No page id is reserved for [`PageKind::FreeSpaceMap`].
 
 use crate::checksum::Checksum;
 use crate::codec::{CodecError, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
@@ -127,10 +133,57 @@ impl Lsn {
     }
 }
 
+/// Allocator header. It occupies page 2.
+///
+/// # Examples
+///
+/// ```ignore
+/// use pizzlydb_storage::page::ALLOCATOR_PAGE_ID;
+///
+/// assert_eq!(ALLOCATOR_PAGE_ID.as_u64(), 2);
+/// ```
+pub const ALLOCATOR_PAGE_ID: PageId = PageId::new(2);
+
+/// Allocation bitmap. It occupies page 3.
+///
+/// # Examples
+///
+/// ```ignore
+/// use pizzlydb_storage::page::BITMAP_PAGE_ID;
+///
+/// assert_eq!(BITMAP_PAGE_ID.as_u64(), 3);
+/// ```
+pub const BITMAP_PAGE_ID: PageId = PageId::new(3);
+
+/// First page id available for a data page.
+///
+/// Pages 0 and 1 are the superblock copies. [`ALLOCATOR_PAGE_ID`] and
+/// [`BITMAP_PAGE_ID`] are the other reserved ids. Allocation does not return
+/// those four ids.
+///
+/// # Examples
+///
+/// ```ignore
+/// use pizzlydb_storage::page::{
+///     ALLOCATOR_PAGE_ID, BITMAP_PAGE_ID, FIRST_DATA_PAGE_ID,
+/// };
+///
+/// assert_eq!(ALLOCATOR_PAGE_ID.as_u64(), 2);
+/// assert_eq!(BITMAP_PAGE_ID.as_u64(), 3);
+/// assert_eq!(FIRST_DATA_PAGE_ID.as_u64(), 4);
+/// ```
+pub const FIRST_DATA_PAGE_ID: PageId = PageId::new(4);
+
 /// Kind of a page image.
 ///
 /// The numeric values are version 1 of this crate and are the on-disk `u16`.
 /// Append a new kind. Do not reuse or renumber an existing value.
+///
+/// Pages 0 and 1 are the superblock copies. [`ALLOCATOR_PAGE_ID`] and
+/// [`BITMAP_PAGE_ID`] stay allocated for the life of the file.
+/// [`FIRST_DATA_PAGE_ID`] is the first id a data page may use. Free-space
+/// hints live in the allocator header. No page id is reserved for
+/// [`Self::FreeSpaceMap`].
 ///
 /// # Examples
 ///
@@ -149,11 +202,14 @@ pub enum PageKind {
     Free = 0,
     /// Database superblock.
     Superblock = 1,
-    /// Allocator header.
+    /// Allocator header at [`ALLOCATOR_PAGE_ID`].
     Allocator = 2,
-    /// Extent allocation bitmap.
+    /// Extent allocation bitmap at [`BITMAP_PAGE_ID`].
     Bitmap = 3,
-    /// Free-space map.
+    /// Free-space map page.
+    ///
+    /// Hints for this format are stored in the allocator header. This kind
+    /// has no reserved page id.
     FreeSpaceMap = 4,
     /// Internal node of a B-tree.
     BTreeInternal = 5,

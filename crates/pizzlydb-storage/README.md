@@ -2,7 +2,7 @@
 
 In-house page engine and the byte-oriented `StorageEngine` boundary.
 
-The virtual file system, page headers, CRC-32C checksums, write-ahead log, superblock, and pager are implemented and crate-private. The page allocator, B-tree, and `StorageEngine` boundary are not implemented. The crate exports no public API.
+The virtual file system, page headers, CRC-32C checksums, write-ahead log, superblock, pager, and page allocator are implemented and crate-private. The B-tree and `StorageEngine` boundary are not implemented. The crate exports no public API.
 
 ## Purpose
 
@@ -23,7 +23,7 @@ Graph records, multi-version concurrency control (MVCC), and the logical commit 
 
 `checksum`, `codec`, `page`, `superblock`, `meta`, `vfs`, `vfs_memory`, `vfs_posix`, `pager`, `space`, `wal`, `btree`, `maintain`, `backup`, `verify`, `inspect`, `salvage`, and `engine`.
 
-`checksum` is the CRC-32C used by page images and the write-ahead log. `codec` is the little-endian integer encoding for those records. `page` is the fixed-size image and its header. `space` is the extent bitmap and free-space map. `wal` is the physical page-image log, not the logical commit log. `pager` caches a fixed number of page images keyed by page id and LSN. A pin releases its frame on drop. A snapshot registration releases on drop. Resolution returns the newest committed image at or before the snapshot LSN. `superblock` stores two checksummed copies of the file identity, format version, generation, checkpoint LSN, logical page count, and the allocator, free-space map, and B-tree root page ids.
+`checksum` is the CRC-32C used by page images and the write-ahead log. `codec` is the little-endian integer encoding for those records. `page` is the fixed-size image and its header. `space` allocates page ids with an extent bitmap. The bitmap is the authority. A retire entry keeps its bit set until `reclaim` runs with a horizon strictly above that entry's LSN. Free-space hints are not authority. The header stores 64 retire entries and spills the rest onto retire-spill pages. `wal` is the physical page-image log, not the logical commit log. `pager` caches a fixed number of page images keyed by page id and LSN. A pin releases its frame on drop. A snapshot registration releases on drop. Resolution returns the newest committed image at or before the snapshot LSN. `superblock` stores two checksummed copies of the file identity, format version, generation, checkpoint LSN, logical page count, and the allocator, free-space map, and B-tree root page ids. `meta` does not store node or edge counters. The bitmap page id is in the allocator header. The B-tree root page id is in the superblock.
 
 ## License
 
