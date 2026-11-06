@@ -7,7 +7,7 @@ use std::path::Path;
 
 #[cfg(unix)]
 use pizzlydb_storage::PosixVfs;
-use pizzlydb_storage::{Durability, MemoryVfs, Storage, StorageError};
+use pizzlydb_storage::{Durability, MAX_KEY_LEN, MAX_VALUE_LEN, MemoryVfs, Storage, StorageError};
 
 use common::{apply, fill, records};
 
@@ -158,11 +158,17 @@ fn drop_and_reject(db: &Storage<impl pizzlydb_storage::Vfs>) {
     assert!(records(db).is_empty());
 
     let mut batch = db.begin_write().unwrap();
-    let too_long = vec![0u8; 257];
+    let too_long = vec![0u8; MAX_KEY_LEN + 1];
     assert!(matches!(
         batch.put(&too_long, b"x"),
         Err(StorageError::Full)
     ));
+    let too_large = vec![0u8; MAX_VALUE_LEN + 1];
+    assert!(matches!(
+        batch.put(b"k", &too_large),
+        Err(StorageError::Full)
+    ));
+    batch.put(&vec![1u8; MAX_KEY_LEN], b"x").unwrap();
     drop(batch);
 }
 

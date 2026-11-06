@@ -1,2 +1,6 @@
 [files]
 extend-exclude = ["LICENSE", "LICENSES/**"]
+
+[default.extend-words]
+# "café" in a property-value fixture. The unicode escape splits the word.
+caf = "caf"

@@ -85,13 +85,18 @@ dependencies = [
 [[package]]
 name = "pizzlydb-core"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "pizzlydb-graph"
 version = "0.1.0"
 dependencies = [
  "pizzlydb-core",
+ "pizzlydb-storage",
  "pizzlydb-txn",
+ "thiserror",
 ]
 
 [[package]]

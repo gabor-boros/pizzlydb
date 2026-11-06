@@ -14,6 +14,8 @@ The index, the log record layout, and the file format stay inside this crate. Hi
 
 `Storage`, `StorageEngine`, `ReadView`, `WriteBatch`, `Scan`, `StorageError`, `Durability`, `Lsn`, and the `Vfs` traits and backends.
 
+`MAX_KEY_LEN` (512 bytes) and `MAX_VALUE_LEN` are the largest key and value a batch accepts. A larger key or value returns `StorageError::Full`. A value too large for one leaf page is stored on overflow pages.
+
 ## License
 
 Licensed under the [Apache License 2.0](../../LICENSE).

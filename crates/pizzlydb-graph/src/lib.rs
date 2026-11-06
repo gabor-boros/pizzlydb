@@ -1,15 +1,72 @@
-//! Graph records, the segmented identifier directory, adjacency, properties,
-//! indexes, and constraints.
+//! Property graph stored as keys in the `pizzlydb-storage` ordered map.
 //!
-//! This crate depends on `pizzlydb-core` and `pizzlydb-txn`. It does not import
-//! `pizzlydb-storage` until a page API exists, and it does not import protocol
-//! or server code.
+//! [`GraphStore`] reads and writes the keys of one namespace: node and edge
+//! records, catalog names, node labels, both adjacency directions, property
+//! cells and declarations, secondary indexes, and label and relationship-type
+//! membership. Reads take any [`KeyRead`]: a committed
+//! [`ReadView`](pizzlydb_storage::ReadView) or an open [`GraphBatch`]. Writes
+//! stage keys on a [`GraphBatch`], which reads its own staged writes and
+//! publishes them as one atomic storage batch on [`GraphBatch::commit`].
+//!
+//! This crate does not import protocol or server code.
+//!
+//! # Examples
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::path::Path;
+//!
+//! use pizzlydb_core::{LabelId, NamespaceId, PropertyKeyId, TypeId, Value};
+//! use pizzlydb_graph::{Direction, GraphBatch, GraphStore, Owner, Scope};
+//! use pizzlydb_storage::{Durability, MemoryVfs, Storage};
+//!
+//! let vfs = MemoryVfs::new();
+//! let storage = Storage::create(&vfs, Path::new("db"), 8, Durability::Full, |id| id.fill(1))?;
+//! let graph = GraphStore::new(NamespaceId::from_u128(1)?);
+//!
+//! let mut batch = GraphBatch::begin(&storage)?;
+//! let person: LabelId = graph.intern(&mut batch, "Person")?;
+//! let knows: TypeId = graph.intern(&mut batch, "KNOWS")?;
+//! let name: PropertyKeyId = graph.intern(&mut batch, "name")?;
+//! let by_name = graph.create_index(&mut batch, Scope::Label(person), name, true)?;
+//!
+//! let ada = graph.create_node(&mut batch)?;
+//! let alan = graph.create_node(&mut batch)?;
+//! for (node, text) in [(ada, "Alice"), (alan, "Alan")] {
+//!     graph.add_label(&mut batch, node, person)?;
+//!     graph.set_property(&mut batch, node, name, &Value::from(text))?;
+//! }
+//! graph.create_edge(&mut batch, ada, alan, knows)?;
+//! batch.commit()?;
+//!
+//! let view = storage.snapshot()?;
+//! let found = graph.index_lookup(&view, by_name, &Value::from("Alice"))?.collect::<Result<Vec<_>, _>>()?;
+//! assert_eq!(found, vec![Owner::Node(ada)]);
+//! let friend = graph.neighbors(&view, ada, Direction::Out)?.next().transpose()?;
+//! assert_eq!(friend.map(|entry| entry.neighbor), Some(alan));
+//! # Ok(())
+//! # }
+//! ```
 
+mod access;
 mod adjacency;
+mod batch;
 mod catalog;
 mod constraint;
 mod directory;
+mod error;
 mod index;
+mod keys;
 mod property;
 mod record;
 mod record_store;
+
+pub use access::{IdScan, KeyRead};
+pub use adjacency::{Direction, Neighbor, Neighbors};
+pub use batch::{BatchScan, GraphBatch};
+pub use catalog::{CatalogId, MAX_NAME_LEN};
+pub use error::GraphError;
+pub use index::{IndexDefinition, IndexScan};
+pub use property::{Owner, PropertyDeclaration, Scope};
+pub use record::{EdgeRecord, NodeRecord};
+pub use record_store::GraphStore;

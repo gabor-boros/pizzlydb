@@ -140,25 +140,9 @@ impl Lsn {
 }
 
 /// Allocator header. It occupies page 2.
-///
-/// # Examples
-///
-/// ```ignore
-/// use pizzlydb_storage::page::ALLOCATOR_PAGE_ID;
-///
-/// assert_eq!(ALLOCATOR_PAGE_ID.as_u64(), 2);
-/// ```
 pub const ALLOCATOR_PAGE_ID: PageId = PageId::new(2);
 
 /// Allocation bitmap. It occupies page 3.
-///
-/// # Examples
-///
-/// ```ignore
-/// use pizzlydb_storage::page::BITMAP_PAGE_ID;
-///
-/// assert_eq!(BITMAP_PAGE_ID.as_u64(), 3);
-/// ```
 pub const BITMAP_PAGE_ID: PageId = PageId::new(3);
 
 /// First page id available for a data page.
@@ -166,18 +150,6 @@ pub const BITMAP_PAGE_ID: PageId = PageId::new(3);
 /// Pages 0 and 1 are the superblock copies. [`ALLOCATOR_PAGE_ID`] and
 /// [`BITMAP_PAGE_ID`] are the other reserved ids. Allocation does not return
 /// those four ids.
-///
-/// # Examples
-///
-/// ```ignore
-/// use pizzlydb_storage::page::{
-///     ALLOCATOR_PAGE_ID, BITMAP_PAGE_ID, FIRST_DATA_PAGE_ID,
-/// };
-///
-/// assert_eq!(ALLOCATOR_PAGE_ID.as_u64(), 2);
-/// assert_eq!(BITMAP_PAGE_ID.as_u64(), 3);
-/// assert_eq!(FIRST_DATA_PAGE_ID.as_u64(), 4);
-/// ```
 pub const FIRST_DATA_PAGE_ID: PageId = PageId::new(4);
 
 /// Kind of a page image.

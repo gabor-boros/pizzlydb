@@ -75,14 +75,8 @@ use crate::page::{HEADER_SIZE, Lsn, PAGE_SIZE, PageHeader, PageId, PageKind};
 
 /// Maximum key length in bytes.
 ///
-/// # Examples
-///
-/// ```ignore
-/// use pizzlydb_storage::btree::MAX_KEY_LEN;
-///
-/// assert_eq!(MAX_KEY_LEN, 256);
-/// ```
-pub(crate) const MAX_KEY_LEN: usize = 256;
+/// A longer key is rejected by `put`, `delete`, `get`, and `scan`.
+pub const MAX_KEY_LEN: usize = 512;
 
 /// Maximum number of parent links followed from a leaf to the root.
 pub(crate) const MAX_TREE_HOPS: u32 = 64;
@@ -106,15 +100,6 @@ const RESERVED_OFF: usize = HEADER_SIZE + 36;
 const BODY_OFF: usize = HEADER_SIZE + 40;
 
 /// Bytes available for packed entries on a leaf or internal page.
-///
-/// # Examples
-///
-/// ```ignore
-/// use pizzlydb_storage::btree::{BODY_CAP, MIN_PAYLOAD};
-///
-/// assert!(MIN_PAYLOAD * 2 <= BODY_CAP);
-/// assert!(BODY_CAP > 256);
-/// ```
 pub(crate) const BODY_CAP: usize = PAGE_SIZE - BODY_OFF;
 
 /// Minimum payload of a non-root node after insert or delete returns.
@@ -135,16 +120,11 @@ const OV_DATA_OFF: usize = HEADER_SIZE + 16;
 /// Data bytes stored on one overflow page.
 pub(crate) const OVERFLOW_CHUNK: usize = PAGE_SIZE - HEADER_SIZE - 16;
 
-/// Maximum value length accepted by [`BTree::insert`].
+/// Maximum value length in bytes.
 ///
-/// # Examples
-///
-/// ```ignore
-/// use pizzlydb_storage::btree::{MAX_OVERFLOW_HOPS, MAX_VALUE_LEN, OVERFLOW_CHUNK};
-///
-/// assert_eq!(MAX_VALUE_LEN, MAX_OVERFLOW_HOPS as usize * OVERFLOW_CHUNK);
-/// ```
-pub(crate) const MAX_VALUE_LEN: usize = MAX_OVERFLOW_HOPS as usize * OVERFLOW_CHUNK;
+/// A value whose leaf entry does not fit one page is stored on overflow pages.
+/// A value longer than this limit is rejected by `put`.
+pub const MAX_VALUE_LEN: usize = MAX_OVERFLOW_HOPS as usize * OVERFLOW_CHUNK;
 
 const _: () = assert!(BODY_OFF + BODY_CAP == PAGE_SIZE);
 const _: () = assert!(OV_DATA_OFF + OVERFLOW_CHUNK == PAGE_SIZE);
@@ -2870,7 +2850,7 @@ mod tests {
     fn example_new_tree_is_empty() {
         assert_eq!(BTree::new().root(), PageId::new(0));
         assert_eq!(BTree::from_root(PageId::new(4)).root(), PageId::new(4));
-        assert_eq!(MAX_KEY_LEN, 256);
+        assert_eq!(MAX_KEY_LEN, 512);
         assert_eq!(
             MAX_VALUE_LEN,
             super::MAX_OVERFLOW_HOPS as usize * OVERFLOW_CHUNK

@@ -2,7 +2,7 @@
 
 pizzlydb is a transactional, graph-native operational database. It maintains supported graph-query results and delivers durable, resumable subscriptions.
 
-The workspace crates are skeletons. Each crate `README.md` describes that crate's intended contract. `pizzlydb-storage` is the in-house page engine (VFS, pager, WAL, and B-tree). `pizzlydb-core` holds identifiers, values, errors, and commit sequence numbers. `pizzlydb-txn` holds MVCC, validation, and the logical mutation log. `pizzlydb-graph` holds records, the identifier directory, adjacency, properties, indexes, and constraints.
+`pizzlydb-storage`, `pizzlydb-core`, and `pizzlydb-graph` are implemented; the other workspace crates are skeletons. Each crate `README.md` describes that crate's contract. `pizzlydb-storage` is the in-house ordered key-value engine (VFS, pager, WAL, and B-tree). `pizzlydb-core` holds identifiers, values, and their ordered key encodings. `pizzlydb-txn` will hold MVCC, validation, and the logical mutation log. `pizzlydb-graph` stores records, catalog names, adjacency, properties, indexes, and constraints as keys in the storage map.
 
 - `pizzlydb-core` — identifiers, typed values, errors, and commit sequence numbers
 - `pizzlydb-storage` — page engine and the `StorageEngine` boundary
@@ -33,7 +33,7 @@ cargo fmt --all
 # Strict linting
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Run tests. The skeleton has no tests yet, so an empty run succeeds.
+# Run tests. Skeleton crates have no tests, so an empty run succeeds.
 cargo nextest run --workspace --no-tests=pass
 
 # Run doctests separately

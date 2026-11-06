@@ -42,6 +42,7 @@ pub mod vfs_posix;
 #[cfg_attr(not(test), allow(dead_code))]
 mod wal;
 
+pub use btree::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use engine::{Durability, ReadView, Scan, Storage, StorageEngine, StorageError, WriteBatch};
 pub use page::Lsn;
 pub use vfs::{Fault, FaultInjecting, FaultKind, FileRole, OpenOptions, Vfs, VfsError, VfsFile};
