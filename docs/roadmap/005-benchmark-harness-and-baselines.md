@@ -57,11 +57,11 @@ Before [017](017-concurrent-page-table-and-zero-copy-reads.md), [020](020-group-
 
 ## Acceptance Criteria
 
-- [ ] `cargo bench -p pizzlydb-storage` and `cargo bench -p pizzlydb-graph` run the documented suites.
-- [ ] The baseline report includes WAL bytes per inserted key, the cost of a B-tree split in pages written, and point-read latency as a function of WAL size (which shows the linear-scan effect).
+- [x] `cargo bench -p pizzlydb-storage` and `cargo bench -p pizzlydb-graph` run the documented suites.
+- [x] The baseline report includes WAL bytes per inserted key, the cost of a B-tree split in pages written, and point-read latency as a function of WAL size (which shows the linear-scan effect).
 - [ ] Two runs on the same machine with the same seed differ by less than a documented tolerance, for example 5% median.
-- [ ] Benchmark code uses only public APIs or explicit `bench` features, never private internals.
-- [ ] `rust-toolchain.toml` names an exact version (for example `1.xx.y`), and the baseline report records it.
+- [x] Benchmark code uses only public APIs or explicit `bench` features, never private internals.
+- [x] `rust-toolchain.toml` names an exact version (for example `1.xx.y`), and the baseline report records it.
 
 ## Testing and Validation
 

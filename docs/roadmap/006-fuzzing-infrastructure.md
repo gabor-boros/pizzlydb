@@ -52,10 +52,10 @@ The engine verifies checksums, but a valid checksum does not prove the structure
 
 ## Acceptance Criteria
 
-- [ ] Every decoder listed above has a fuzz target in CI.
+- [x] Every decoder listed above has a fuzz target in CI.
 - [ ] Each target runs for one hour locally without a panic, or every finding is fixed and has a regression test.
-- [ ] Engine-level fuzzing proves that `Storage::open` on arbitrary bytes returns `Ok` or a typed `StorageError` and never panics.
-- [ ] `CONTRIBUTING` documents how to add a target and how to reproduce a crash.
+- [x] Engine-level fuzzing proves that `Storage::open` on arbitrary bytes returns `Ok` or a typed `StorageError` and never panics.
+- [x] `CONTRIBUTING` documents how to add a target and how to reproduce a crash.
 
 ## Testing and Validation
 

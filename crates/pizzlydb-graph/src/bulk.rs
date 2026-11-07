@@ -114,7 +114,21 @@ pub struct LoadReport {
 /// produce the same identifiers.
 ///
 /// An existing destination file or log is left unchanged. Validation runs
-/// before any destination file is created.
+/// before any destination file is created. The destination file identity is
+/// drawn from a CSPRNG.
+///
+/// # Limitations
+///
+/// - **Offline only.** Nothing excludes a live writer at `destination`.
+///   [Read-only open](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/015-exclusive-ownership-and-read-only-open.md)
+///   is later work.
+/// - **Single namespace.** Every record is written into `namespace`.
+/// - **Single transaction.** Names, nodes, edges, properties, and indexes are
+///   committed as one [`GraphBatch`](crate::GraphBatch).
+///   [Bounded bulk load](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/110-bounded-memory-bulk-loader.md)
+///   is later work.
+/// - **In-memory input.** `script` is one string. Sort runs may spill when
+///   `temp_budget` is set, and the input itself is not streamed.
 ///
 /// # Errors
 ///
@@ -168,8 +182,9 @@ pub fn bulk_load<V: Vfs>(
     let (runs, temp_bytes) = collect_runs(vfs, script, destination, options.temp_budget)?;
     report.temp_bytes = temp_bytes;
 
+    let file_id = salvage::fresh_identity()?;
     let storage = Storage::create(vfs, &partial, FRAME_COUNT, Durability::Full, |id| {
-        id.fill(1)
+        *id = file_id;
     })?;
     let graph = GraphStore::new(namespace);
     {

@@ -18,7 +18,10 @@
 //! - free-space map page id `u64`
 //! - B-tree root page id `u64`
 //!
-//! Bytes after [`BODY_END`] are zero. The body has no node or edge counters.
+//! Bytes after [`BODY_END`] are zero. The body has no node or edge counters
+//! and no database lineage field. The file id identifies this main file and
+//! its log only. A later copy draws a new file id; lineage is deferred to the
+//! backup manifest. See `docs/architecture/file-identity.md`.
 //! A major other than [`FORMAT_MAJOR`], a minor other than [`FORMAT_MINOR`], or
 //! a page size other than [`PAGE_SIZE`](crate::page::PAGE_SIZE) is
 //! [`SuperblockError::UnsupportedVersion`].

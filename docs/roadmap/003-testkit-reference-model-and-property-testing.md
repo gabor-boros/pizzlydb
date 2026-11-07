@@ -47,11 +47,11 @@ Guide §12.1 calls for model-based, property-based, differential, and history-ch
 
 ## Acceptance Criteria
 
-- [ ] `pizzlydb-testkit` exposes `ReferenceGraph`, `Operation`, `History`, generators, and a `run_history` driver, each with rustdoc and a doctest.
-- [ ] The current graph crate passes a property test of at least 1,000 generated histories against the model, run in CI with a fixed seed budget.
-- [ ] A deliberately injected bug, such as skipping one adjacency key on edge delete, is caught and minimized to a history of at most 10 operations.
-- [ ] A failing seed reproduces the identical failure.
-- [ ] The testkit never depends on storage internals; it uses only public crate APIs.
+- [x] `pizzlydb-testkit` exposes `ReferenceGraph`, `Operation`, `History`, generators, and a `run_history` driver, each with rustdoc and a doctest.
+- [x] The current graph crate passes a property test of at least 1,000 generated histories against the model, run in CI with a fixed seed budget.
+- [x] A deliberately injected bug, such as skipping one adjacency key on edge delete, is caught and minimized to a history of at most 10 operations.
+- [x] A failing seed reproduces the identical failure.
+- [x] The testkit never depends on storage internals; it uses only public crate APIs.
 
 ## Testing and Validation
 

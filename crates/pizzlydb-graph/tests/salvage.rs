@@ -599,3 +599,58 @@ fn bulk_rename_fault_does_not_publish() {
         .unwrap_err();
     assert!(matches!(missing, VfsError::NotFound));
 }
+
+#[test]
+fn bulk_loads_get_distinct_file_identities() {
+    let vfs = MemoryVfs::new();
+    let script = "node a\n";
+    let namespace = NamespaceId::from_u128(1).unwrap();
+    bulk_load(
+        &vfs,
+        script,
+        Path::new("one"),
+        namespace,
+        LoadOptions::new(),
+    )
+    .unwrap();
+    bulk_load(
+        &vfs,
+        script,
+        Path::new("two"),
+        namespace,
+        LoadOptions::new(),
+    )
+    .unwrap();
+
+    let one = Storage::open(&vfs, Path::new("one"), 8, Durability::Full).unwrap();
+    let two = Storage::open(&vfs, Path::new("two"), 8, Durability::Full).unwrap();
+    assert_ne!(one.file_identity(), two.file_identity());
+    assert_ne!(one.file_identity(), [1; 16]);
+}
+
+#[test]
+fn salvage_reports_an_omitted_namespace_and_a_fresh_identity() {
+    let vfs = MemoryVfs::new();
+    let storage = Storage::create(&vfs, Path::new("src"), 8, Durability::Full, |id| {
+        id.fill(3);
+    })
+    .unwrap();
+    let source_id = storage.file_identity();
+    let kept = GraphStore::new(NamespaceId::from_u128(1).unwrap());
+    let other = GraphStore::new(NamespaceId::from_u128(2).unwrap());
+    let mut batch = GraphBatch::begin(&storage).unwrap();
+    kept.create_node(&mut batch).unwrap();
+    other.create_node(&mut batch).unwrap();
+    batch.commit().unwrap();
+    drop(storage);
+
+    let report = salvage(&vfs, Path::new("src"), Path::new("dst"), kept.namespace()).unwrap();
+    assert_eq!(report.omitted_namespaces, vec![other.namespace()]);
+    let destination = Storage::open(&vfs, Path::new("dst"), 8, Durability::Full).unwrap();
+    assert_ne!(destination.file_identity(), source_id);
+    let missing = other.get_node(
+        &destination.snapshot().unwrap(),
+        NodeId::from_u128(1).unwrap(),
+    );
+    assert!(matches!(missing, Err(GraphError::NotFound)));
+}

@@ -50,10 +50,10 @@ File identity is the only guard against pairing a main file with the wrong WAL. 
 
 ## Acceptance Criteria
 
-- [ ] No production code path creates a database with a constant or copied file identity. A test asserts that two bulk loads produce different identities.
-- [ ] A test pairs a backup with the source's WAL file and gets `StorageError::Corrupt` (identity mismatch) instead of a silent replay.
-- [ ] Every limitation listed above is documented on the public function and linked to its follow-up issue.
-- [ ] `cargo test --workspace --locked` and `cargo clippy --workspace --all-targets --locked -- -D warnings` pass.
+- [x] No production code path creates a database with a constant or copied file identity. A test asserts that two bulk loads produce different identities.
+- [x] A test pairs a backup with the source's WAL file and gets `StorageError::Corrupt` (identity mismatch) instead of a silent replay.
+- [x] Every limitation listed above is documented on the public function and linked to its follow-up issue.
+- [x] `cargo test --workspace --locked` and `cargo clippy --workspace --all-targets --locked -- -D warnings` pass.
 
 ## Testing and Validation
 

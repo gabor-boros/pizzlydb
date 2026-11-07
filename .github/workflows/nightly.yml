@@ -1,0 +1,96 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-long:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CC: clang
+      CXX: clang++
+      RUSTUP_TOOLCHAIN: nightly
+    permissions:
+      contents: read
+      actions: write # crash and log artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - name: Long run
+        shell: bash
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bins
+          mkdir -p artifacts logs
+          targets="page_header superblock wal_header wal_frame btree_node \
+            overflow allocator bitmap retire_spill value key graph_record \
+            declaration index_definition engine"
+          for target in ${targets}; do
+            mkdir -p "artifacts/${target}"
+            ./target/release/"${target}" "corpus/${target}" \
+              -max_total_time=600 \
+              -artifact_prefix="artifacts/${target}/" \
+              | tee "logs/${target}.log"
+          done
+      - name: Upload crashes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+      - name: Upload libFuzzer logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-coverage-logs
+          path: fuzz/logs
+          if-no-files-found: ignore
+
+  crash-budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+      PIZZLYDB_CRASH_SAMPLES: "32"
+    permissions:
+      contents: read
+      actions: write # rust-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+      - name: Large crash sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --locked test -p pizzlydb-storage --test crash_sim -- --test-threads=1

@@ -204,7 +204,7 @@ impl PropertyDeclaration {
         }
     }
 
-    fn encode(self) -> Vec<u8> {
+    pub(crate) fn encode(self) -> Vec<u8> {
         vec![
             DECLARATION_VERSION,
             self.value_type.tag(),
@@ -212,7 +212,7 @@ impl PropertyDeclaration {
         ]
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
         match bytes {
             [DECLARATION_VERSION, tag, nullable @ (0 | 1)] => Ok(Self {
                 value_type: ValueType::from_tag(*tag).map_err(corrupt)?,

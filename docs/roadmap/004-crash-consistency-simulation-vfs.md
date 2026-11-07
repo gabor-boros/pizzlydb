@@ -48,10 +48,10 @@ Add a simulated file system that models what real kernels and disks do on power 
 
 ## Acceptance Criteria
 
-- [ ] `CrashSimVfs` implements `Vfs`, is documented, and is shared through `pizzlydb-testkit` or a `test-support` feature.
-- [ ] A regression test reproduces the `Wal::prune` hazard: it finds a crash point and persistence subset after which either a commit acknowledged with `Durability::Full` is missing or `Storage::open` returns `Corrupt`. The test is committed as `#[ignore]` or as an expected failure until [012](012-crash-safe-wal-reset.md) fixes the bug.
-- [ ] All existing `engine_crash.rs` scenarios pass under the new model or have a documented reason why not.
-- [ ] Each crash enumeration is reproducible from its seed.
+- [x] `CrashSimVfs` implements `Vfs`, is documented, and is shared through `pizzlydb-testkit` or a `test-support` feature.
+- [x] A regression test reproduces the `Wal::prune` hazard: it finds a crash point and persistence subset after which either a commit acknowledged with `Durability::Full` is missing or `Storage::open` returns `Corrupt`. The test is committed as `#[ignore]` or as an expected failure until [012](012-crash-safe-wal-reset.md) fixes the bug.
+- [x] All existing `engine_crash.rs` scenarios pass under the new model or have a documented reason why not.
+- [x] Each crash enumeration is reproducible from its seed.
 
 ## Testing and Validation
 

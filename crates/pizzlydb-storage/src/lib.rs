@@ -27,19 +27,20 @@ mod btree;
 mod checksum;
 mod codec;
 mod engine;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 mod inspect;
 mod maintain;
-mod meta;
 mod page;
 #[cfg_attr(not(test), allow(dead_code))]
 mod pager;
-mod salvage;
 #[cfg_attr(not(test), allow(dead_code))]
 mod space;
 #[cfg_attr(not(test), allow(dead_code))]
 mod superblock;
 mod verify;
 pub mod vfs;
+pub mod vfs_crash;
 pub mod vfs_memory;
 #[cfg(unix)]
 pub mod vfs_posix;
@@ -48,11 +49,18 @@ mod wal;
 
 pub use backup::{BackupReport, backup, export_checkpoint, publish, restore};
 pub use btree::{MAX_KEY_LEN, MAX_VALUE_LEN};
-pub use engine::{Durability, ReadView, Scan, Storage, StorageEngine, StorageError, WriteBatch};
+pub use engine::{
+    Durability, ReadView, Scan, Storage, StorageEngine, StorageError, WriteBatch, random_file_id,
+    wal_path,
+};
 pub use inspect::{Damage, DamageReason, InspectReport, inspect};
 pub use page::{Lsn, PageId};
+pub use pager::PagerStats;
 pub use verify::verify_quick;
 pub use vfs::{Fault, FaultInjecting, FaultKind, FileRole, OpenOptions, Vfs, VfsError, VfsFile};
+pub use vfs_crash::{
+    CrashSimConfig, CrashSimVfs, FsyncFault, PersistMode, crash_seed, for_each_crash,
+};
 pub use vfs_memory::MemoryVfs;
 #[cfg(unix)]
 pub use vfs_posix::PosixVfs;

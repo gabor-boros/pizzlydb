@@ -767,4 +767,4 @@ External normative references to verify during implementation:
 - **Rust language and toolchain:** stable edition, API safety, and cross-platform support.
 - **[Timely Dataflow / Differential Dataflow](https://github.com/TimelyDataflow/differential-dataflow):** candidate execution techniques, not mandatory dependencies.
 
-This guide fixes product-level invariants. Accepted [ADRs](../adr/README.md) and [RFCs](../rfcs/README.md), together with the executable tests they name, fix byte formats, grammar productions, state transitions, RPC schemas, and failure matrices.
+This guide fixes product-level invariants. Accepted [ADRs](../adr/README.md) and [RFCs](../rfcs/README.md), together with the executable tests they name, fix byte formats, grammar productions, state transitions, RPC schemas, and failure matrices. There is no `docs/specifications/` tree.

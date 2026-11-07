@@ -24,7 +24,7 @@ use crate::page::{
     ALLOCATOR_PAGE_ID, BITMAP_PAGE_ID, HEADER_SIZE, LSN_OFFSET, Lsn, PAGE_SIZE, PageHeader, PageId,
     PageKind, seal,
 };
-use crate::pager::{Pager, PagerError, SnapshotGuard};
+use crate::pager::{Pager, PagerError, PagerStats, SnapshotGuard};
 use crate::space::{INITIAL_PAGES, Space, SpaceError, SpillImage};
 use crate::superblock::{self, Superblock, SuperblockError};
 use crate::vfs::{FileRole, OpenOptions, Vfs, VfsError, VfsFile, io_error};
@@ -33,6 +33,38 @@ use crate::wal::{Wal, WalError};
 use crate::maintain;
 
 pub use crate::wal::Durability;
+
+/// Draw a 16-byte file identity from the operating system's CSPRNG.
+///
+/// Backup, export, restore, bulk load, and salvage use this for every database
+/// they create. Callers of [`Storage::create`] can pass the bytes through the
+/// `random` closure, or supply their own.
+///
+/// # Errors
+///
+/// Returns [`StorageError::Io`] when the generator cannot fill the buffer.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use pizzlydb_storage::{Durability, MemoryVfs, Storage, random_file_id};
+///
+/// let id = random_file_id().unwrap();
+/// let vfs = MemoryVfs::new();
+/// let db = Storage::create(&vfs, Path::new("fresh"), 2, Durability::Full, |slot| {
+///     *slot = id;
+/// })
+/// .unwrap();
+///
+/// assert_eq!(db.file_identity(), id);
+/// ```
+pub fn random_file_id() -> Result<[u8; 16], StorageError> {
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|_| StorageError::Io(io_error("csprng failed")))?;
+    Ok(id)
+}
 
 pub(crate) const STATE_PAGE_ID: PageId = PageId::new(4);
 const STATE_ROOT_OFFSET: usize = HEADER_SIZE;
@@ -660,10 +692,75 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub(crate) fn logical_pages(&self) -> u64 {
+        self.logical_page_count()
+    }
+
+    /// Pages the superblock says the main file contains.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let db = Storage::create(&vfs, Path::new("pages"), 2, Durability::Full, |id| {
+    ///     id.fill(1);
+    /// })
+    /// .unwrap();
+    ///
+    /// assert!(db.logical_page_count() >= 2);
+    /// ```
+    #[must_use]
+    pub fn logical_page_count(&self) -> u64 {
         self.inner.db.borrow().superblock.logical_page_count()
     }
 
-    pub(crate) fn file_identity(&self) -> [u8; 16] {
+    /// Buffer-pool counters since this handle was opened.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let db = Storage::create(&vfs, Path::new("stats"), 2, Durability::Full, |id| {
+    ///     id.fill(1);
+    /// })
+    /// .unwrap();
+    ///
+    /// assert_eq!(db.stats().hits(), 0);
+    /// ```
+    #[must_use]
+    pub fn stats(&self) -> PagerStats {
+        self.inner.pager.stats()
+    }
+
+    /// File identity stored in the superblock.
+    ///
+    /// The identity binds the main file to its log. A log written for a
+    /// different identity fails [`Storage::open`] with [`StorageError::Corrupt`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let db = Storage::create(&vfs, Path::new("id"), 2, Durability::Full, |id| {
+    ///     id.fill(4);
+    /// })
+    /// .unwrap();
+    ///
+    /// assert_eq!(db.file_identity(), [4; 16]);
+    /// ```
+    #[must_use]
+    pub fn file_identity(&self) -> [u8; 16] {
         self.inner.db.borrow().superblock.file_id()
     }
 
@@ -1509,7 +1606,22 @@ fn offset_of(id: PageId) -> Result<u64, StorageError> {
         .ok_or(StorageError::Corrupt)
 }
 
-pub(crate) fn wal_path(path: &Path) -> PathBuf {
+/// Path of the log beside `path`.
+///
+/// The file name gains a `-wal` suffix. `db` becomes `db-wal`. The directory
+/// is unchanged. An empty path is returned unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use pizzlydb_storage::wal_path;
+///
+/// assert_eq!(wal_path(Path::new("db")), Path::new("db-wal"));
+/// ```
+#[must_use]
+pub fn wal_path(path: &Path) -> PathBuf {
     let Some(name) = path.file_name() else {
         return path.to_path_buf();
     };

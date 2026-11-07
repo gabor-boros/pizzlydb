@@ -95,7 +95,7 @@ const FRAME_LENGTH: usize = 4;
 const FRAME_CHECKSUM: usize = 8;
 
 const KIND_PAGE_IMAGE: u8 = 1;
-const KIND_COMMIT: u8 = 2;
+pub(crate) const KIND_COMMIT: u8 = 2;
 
 const IMAGE_PREFIX: usize = 24;
 const IMAGE_PAYLOAD_LEN: usize = IMAGE_PREFIX + PAGE_SIZE;
@@ -1044,7 +1044,7 @@ fn commit_matches(pending: &[PendingPage], txn_id: u64, lsn: Lsn, page_count: u6
     count == page_count
 }
 
-fn decode_header(bytes: &[u8]) -> Result<[u8; FILE_ID_LEN], WalError> {
+pub(crate) fn decode_header(bytes: &[u8]) -> Result<[u8; FILE_ID_LEN], WalError> {
     if bytes.len() < HEADER_SIZE {
         return Err(WalError::Torn);
     }
@@ -1089,7 +1089,20 @@ fn decode_header(bytes: &[u8]) -> Result<[u8; FILE_ID_LEN], WalError> {
     Ok(file_id)
 }
 
-fn encode_header(file_id: &[u8; FILE_ID_LEN]) -> Result<[u8; HEADER_SIZE], WalError> {
+pub(crate) fn restamp_header(
+    bytes: &mut [u8],
+    file_id: &[u8; FILE_ID_LEN],
+) -> Result<(), WalError> {
+    if bytes.len() < HEADER_SIZE {
+        return Err(WalError::Torn);
+    }
+
+    let header = encode_header(file_id)?;
+    bytes[..HEADER_SIZE].copy_from_slice(&header);
+    Ok(())
+}
+
+pub(crate) fn encode_header(file_id: &[u8; FILE_ID_LEN]) -> Result<[u8; HEADER_SIZE], WalError> {
     let mut header = [0u8; HEADER_SIZE];
     header[MAGIC_OFFSET..MAGIC_OFFSET + MAGIC.len()].copy_from_slice(&MAGIC);
     header[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&VERSION.to_le_bytes());
@@ -1107,7 +1120,7 @@ fn encode_header(file_id: &[u8; FILE_ID_LEN]) -> Result<[u8; HEADER_SIZE], WalEr
     Ok(header)
 }
 
-fn read_frame(bytes: &[u8]) -> Option<(WalFrame, usize)> {
+pub(crate) fn read_frame(bytes: &[u8]) -> Option<(WalFrame, usize)> {
     if bytes.len() < FRAME_HEADER_SIZE {
         return None;
     }
@@ -1240,7 +1253,7 @@ fn commit_payload(
     Ok(payload)
 }
 
-fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, WalError> {
+pub(crate) fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, WalError> {
     if payload.is_empty() || payload.len() > MAX_PAYLOAD {
         return Err(WalError::Corrupt);
     }

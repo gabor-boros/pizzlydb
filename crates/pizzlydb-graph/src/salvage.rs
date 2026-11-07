@@ -4,7 +4,7 @@
 //! log. A failed call leaves an existing destination in place. `destination.partial`
 //! and `destination.source` may remain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use pizzlydb_core::{
@@ -112,7 +112,12 @@ pub enum OmissionReason {
 /// ```
 /// use pizzlydb_graph::SalvageReport;
 ///
-/// let report = SalvageReport { nodes: 1, edges: 0, omissions: Vec::new() };
+/// let report = SalvageReport {
+///     nodes: 1,
+///     edges: 0,
+///     omissions: Vec::new(),
+///     omitted_namespaces: Vec::new(),
+/// };
 /// assert_eq!(report.nodes, 1);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,12 +128,16 @@ pub struct SalvageReport {
     pub edges: u64,
     /// Records that were not copied.
     pub omissions: Vec<Omission>,
+    /// Namespaces present in the source and not copied.
+    pub omitted_namespaces: Vec<NamespaceId>,
 }
 
 /// Copy the committed records of `namespace` from `source` into `destination`.
 ///
-/// Only `namespace` is copied. Records in other namespaces are left behind and
-/// are not omissions. When [`Storage::open`](pizzlydb_storage::Storage::open)
+/// Only `namespace` is copied. Other namespaces are listed in
+/// [`SalvageReport::omitted_namespaces`] and are not per-record omissions.
+/// The destination file identity is drawn from a CSPRNG. When
+/// [`Storage::open`](pizzlydb_storage::Storage::open)
 /// fails and the checkpoint image can be opened, that image is copied and the
 /// report contains one [`OmissionKind::Wal`] omission. Uncheckpointed commits
 /// are not invented. After the copy, [`verify_full`](crate::verify_full) must
@@ -140,6 +149,21 @@ pub struct SalvageReport {
 /// superblock decodes, or the destination copy cannot be published. A unique
 /// index that cannot be rebuilt returns [`GraphError::UniqueConflict`] and
 /// does not replace `destination`.
+///
+/// # Limitations
+///
+/// - **Offline only.** The source is opened through the storage engine, and
+///   nothing excludes a live writer.
+///   [Read-only open](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/015-exclusive-ownership-and-read-only-open.md)
+///   is later work.
+/// - **Single namespace.** Every other namespace is reported and skipped.
+///   [Multi-namespace salvage](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/109-repair-procedures-and-salvage-hardening.md)
+///   is later work.
+/// - **Single transaction.** The copied records are committed as one
+///   [`GraphBatch`](crate::GraphBatch).
+/// - **In-memory copy.** The batch holds the namespace that is copied.
+///   [Bounded bulk load](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/110-bounded-memory-bulk-loader.md)
+///   is the same limit for scripts.
 ///
 /// # Examples
 ///
@@ -180,14 +204,17 @@ pub fn salvage<V: Vfs>(
     let partial = suffix_path(destination, ".partial");
     let (source_db, wal_omitted) = open_readable(vfs, source, destination)?;
     let view = source_db.snapshot()?;
+    let omitted_namespaces = other_namespaces(&view, namespace)?;
+    let file_id = fresh_identity()?;
     let dest_db = Storage::create(vfs, &partial, FRAME_COUNT, Durability::Full, |id| {
-        id.fill(1);
+        *id = file_id;
     })?;
     let graph = GraphStore::new(namespace);
     let mut report = SalvageReport {
         nodes: 0,
         edges: 0,
         omissions: Vec::new(),
+        omitted_namespaces,
     };
     if wal_omitted {
         omit(&mut report, OmissionKind::Wal, 0, OmissionReason::Wal);
@@ -203,6 +230,36 @@ pub fn salvage<V: Vfs>(
     drop(dest_db);
     verify_and_publish(vfs, &partial, destination, namespace)?;
     Ok(report)
+}
+
+pub(crate) fn fresh_identity() -> Result<[u8; ID_LEN], GraphError> {
+    pizzlydb_storage::random_file_id().map_err(GraphError::from)
+}
+
+fn other_namespaces<R: KeyRead>(
+    read: &R,
+    kept: NamespaceId,
+) -> Result<Vec<NamespaceId>, GraphError> {
+    let mut found = BTreeSet::new();
+    let scan = read.scan(&[])?;
+    for item in scan {
+        let (key, _) = item.map_err(GraphError::Storage)?;
+        let Some(bytes) = key.get(..ID_LEN) else {
+            continue;
+        };
+
+        let mut id_bytes = [0u8; ID_LEN];
+        id_bytes.copy_from_slice(bytes);
+
+        let Ok(id) = NamespaceId::from_bytes(id_bytes) else {
+            continue;
+        };
+
+        if id != kept {
+            found.insert(id);
+        }
+    }
+    Ok(found.into_iter().collect())
 }
 
 pub(crate) fn verify_and_publish<V: Vfs>(

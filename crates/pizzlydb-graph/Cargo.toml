@@ -13,11 +13,23 @@ homepage.workspace = true
 readme = "README.md"
 rust-version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 pizzlydb-core = { path = "../pizzlydb-core" }
 pizzlydb-storage = { path = "../pizzlydb-storage" }
 pizzlydb-txn = { path = "../pizzlydb-txn" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+pizzlydb-testkit = { path = "../pizzlydb-testkit" }
+proptest = { workspace = true }
+
+[[bench]]
+name = "graph"
+harness = false
 
 [lints]
 workspace = true

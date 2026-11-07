@@ -1,0 +1,141 @@
+[package]
+name = "pizzlydb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+description = "Coverage-guided decoder fuzz targets. Separate workspace so libFuzzer can unwind."
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pizzlydb-core = { path = "../crates/pizzlydb-core" }
+pizzlydb-graph = { path = "../crates/pizzlydb-graph", features = ["fuzzing"] }
+pizzlydb-storage = { path = "../crates/pizzlydb-storage", features = ["fuzzing"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "page_header"
+path = "fuzz_targets/page_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_header"
+path = "fuzz_targets/wal_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_frame"
+path = "fuzz_targets/wal_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btree_node"
+path = "fuzz_targets/btree_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "overflow"
+path = "fuzz_targets/overflow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "allocator"
+path = "fuzz_targets/allocator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitmap"
+path = "fuzz_targets/bitmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "retire_spill"
+path = "fuzz_targets/retire_spill.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value"
+path = "fuzz_targets/value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key"
+path = "fuzz_targets/key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graph_record"
+path = "fuzz_targets/graph_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "declaration"
+path = "fuzz_targets/declaration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_definition"
+path = "fuzz_targets/index_definition.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine"
+path = "fuzz_targets/engine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "panic_canary"
+path = "fuzz_targets/panic_canary.rs"
+test = false
+doc = false
+bench = false

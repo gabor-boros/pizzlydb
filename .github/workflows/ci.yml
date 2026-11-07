@@ -209,3 +209,85 @@ jobs:
           echo "${expected}  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
           ./actionlint -color
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CC: clang
+      CXX: clang++
+    permissions:
+      contents: read
+      actions: write # rust-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
+      - name: Quick benchmarks
+        continue-on-error: true
+        env:
+          PIZZLYDB_BENCH_QUICK: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --locked bench -p pizzlydb-storage --bench storage
+          cargo --locked bench -p pizzlydb-graph --bench graph
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CC: clang
+      CXX: clang++
+      RUSTUP_TOOLCHAIN: nightly
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - name: Smoke
+        shell: bash
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bins
+          targets="page_header superblock wal_header wal_frame btree_node \
+            overflow allocator bitmap retire_spill value key graph_record \
+            declaration index_definition engine"
+          for target in ${targets}; do
+            ./target/release/"${target}" "corpus/${target}" -max_total_time=60
+          done
+      - name: Panic canary
+        shell: bash
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          set +e
+          ./target/release/panic_canary corpus/panic_canary -max_total_time=10
+          status="$?"
+          set -e
+          if [ "${status}" -eq 0 ]; then
+            printf 'panic canary was not discovered\n' >&2
+            exit 1
+          fi

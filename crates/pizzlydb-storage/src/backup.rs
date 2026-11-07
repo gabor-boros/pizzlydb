@@ -8,7 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
-    STATE_PAGE_ID, Storage, StorageError, decode_state, map_super, map_wal, parent_dir, wal_path,
+    STATE_PAGE_ID, Storage, StorageError, decode_state, map_super, map_wal, parent_dir,
+    random_file_id, wal_path,
 };
 use crate::page::{Lsn, PAGE_SIZE, PageId};
 use crate::superblock::{COPY_A, COPY_B, Superblock};
@@ -53,8 +54,22 @@ pub struct BackupReport {
 
 /// Copy the committed snapshot at `source` to a new database at `destination`.
 ///
-/// The destination log is empty. Commits made on `source` after this call
-/// returns are not in the destination. `source` is not written.
+/// The destination log is empty and starts with a new file identity. Commits
+/// made on `source` after this call returns are not in the destination.
+/// `source` is not written.
+///
+/// # Limitations
+///
+/// - **Offline only.** The source is opened read-write, and nothing excludes a
+///   live writer. [Read-only open](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/015-exclusive-ownership-and-read-only-open.md)
+///   and [online backup](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/105-online-consistent-backup.md)
+///   are later work.
+/// - **Every namespace.** The copy is the whole page file, not one namespace.
+///   A single-namespace copy is [salvage](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/109-repair-procedures-and-salvage-hardening.md).
+/// - **One snapshot.** This is one committed image, not a stream of
+///   transactions. Later commits need [online backup](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/105-online-consistent-backup.md).
+/// - **Not an in-memory script.** Pages are copied from the source file. The
+///   in-memory input limit belongs to [bulk load](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/110-bounded-memory-bulk-loader.md).
 ///
 /// # Errors
 ///
@@ -89,7 +104,7 @@ pub fn backup<V: Vfs>(
     let lsn = view.sequence();
     let state = db.page_image(lsn, STATE_PAGE_ID)?;
     let (root, pages) = decode_state(&state)?;
-    let file_id = db.file_identity();
+    let file_id = random_file_id()?;
     let (allocator, freemap) = db.superblock_slots();
     let page_len = page_len()?;
 
@@ -139,7 +154,19 @@ pub fn backup<V: Vfs>(
 /// Replace `live` with a checked copy of `backup_path`.
 ///
 /// `backup_path` is only read. The previous `live` bytes stay in place when
-/// the check or the directory publish fails.
+/// the check or the directory publish fails. The published database gets a
+/// new file identity, so it does not accept `backup_path`'s log.
+///
+/// # Limitations
+///
+/// - **Offline only.** Nothing excludes a live writer on either path.
+///   [Read-only open](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/015-exclusive-ownership-and-read-only-open.md)
+///   is later work.
+/// - **Every namespace.** Restore publishes the whole copy.
+/// - **One snapshot.** The published image is the backup's snapshot.
+///   [Online backup](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/105-online-consistent-backup.md)
+///   owns a continuous copy.
+/// - **Not an in-memory script.** Both files are copied from disk.
 ///
 /// # Errors
 ///
@@ -178,6 +205,7 @@ pub fn restore<V: Vfs>(vfs: &V, backup_path: &Path, live: &Path) -> Result<(), S
         &wal_path(&partial),
         FileRole::Wal,
     )?;
+    assign_fresh_identity(vfs, &partial)?;
     publish(vfs, &partial, live)
 }
 
@@ -263,21 +291,29 @@ pub fn export_checkpoint<V: Vfs>(
     let page_len = page_len()?;
     let first_ok = file.read_exact(0, &mut first).is_ok();
     let second_ok = file.read_exact(page_len, &mut second).is_ok();
-    let record = match (first_ok, second_ok) {
-        (true, true) => Superblock::select(&first, &second).map_err(map_super)?.0,
-        (true, false) => Superblock::decode(&first, COPY_A).map_err(map_super)?,
-        (false, true) => Superblock::decode(&second, COPY_B).map_err(map_super)?,
+    match (first_ok, second_ok) {
+        (true, true) => {
+            Superblock::select(&first, &second).map_err(map_super)?;
+        }
+        (true, false) => {
+            Superblock::decode(&first, COPY_A).map_err(map_super)?;
+        }
+        (false, true) => {
+            Superblock::decode(&second, COPY_B).map_err(map_super)?;
+        }
         (false, false) => return Err(StorageError::Corrupt),
-    };
+    }
     drop(file);
 
     copy_file(vfs, source, copy_path, FileRole::Main)?;
+    let file_id = random_file_id()?;
+    restamp_main(vfs, copy_path, file_id)?;
     let wal_file = vfs.open(
         &wal_path(copy_path),
         FileRole::Wal,
         &OpenOptions::new().create(true).exclusive(true),
     )?;
-    drop(Wal::create(wal_file, record.file_id()).map_err(map_wal)?);
+    drop(Wal::create(wal_file, file_id).map_err(map_wal)?);
     vfs.sync_dir(parent_dir(copy_path))?;
     Ok(())
 }
@@ -386,4 +422,79 @@ fn replaced_path(path: &Path) -> PathBuf {
 
 fn page_len() -> Result<u64, StorageError> {
     u64::try_from(PAGE_SIZE).map_err(|_| StorageError::Corrupt)
+}
+
+fn assign_fresh_identity<V: Vfs>(vfs: &V, path: &Path) -> Result<[u8; 16], StorageError> {
+    let file_id = random_file_id()?;
+    restamp_main(vfs, path, file_id)?;
+    restamp_wal(vfs, path, file_id)?;
+    Ok(file_id)
+}
+
+fn restamp_main<V: Vfs>(vfs: &V, path: &Path, file_id: [u8; 16]) -> Result<(), StorageError> {
+    let mut file = vfs.open(path, FileRole::Main, &OpenOptions::new())?;
+    let mut first = [0u8; PAGE_SIZE];
+    let mut second = [0u8; PAGE_SIZE];
+    let page_len = page_len()?;
+    file.read_exact(0, &mut first)?;
+    let second_ok = file.read_exact(page_len, &mut second).is_ok();
+    let stamped_a = restamp_superblock(&first, COPY_A, file_id)?;
+    let stamped_b = if second_ok {
+        restamp_superblock(&second, COPY_B, file_id)?
+    } else {
+        None
+    };
+
+    if stamped_a.is_none() && stamped_b.is_none() {
+        return Err(StorageError::Corrupt);
+    }
+
+    if let Some(page) = stamped_a {
+        file.write_all(0, &page)?;
+    }
+
+    if let Some(page) = stamped_b {
+        file.write_all(page_len, &page)?;
+    }
+
+    file.sync()?;
+    Ok(())
+}
+
+fn restamp_superblock(
+    page: &[u8],
+    id: PageId,
+    file_id: [u8; 16],
+) -> Result<Option<[u8; PAGE_SIZE]>, StorageError> {
+    let Ok(record) = Superblock::decode(page, id) else {
+        return Ok(None);
+    };
+
+    let record = Superblock::new(
+        file_id,
+        record.generation(),
+        record.checkpoint_lsn(),
+        record.logical_page_count(),
+        record.allocator_page_id(),
+        record.free_space_map_page_id(),
+        record.btree_root_page_id(),
+    )
+    .map_err(map_super)?;
+
+    record.encode(id).map(Some).map_err(map_super)
+}
+
+fn restamp_wal<V: Vfs>(vfs: &V, path: &Path, file_id: [u8; 16]) -> Result<(), StorageError> {
+    let mut file = vfs.open(&wal_path(path), FileRole::Wal, &OpenOptions::new())?;
+    let len = usize::try_from(file.len()?).map_err(|_| StorageError::Corrupt)?;
+    let mut bytes = vec![0u8; len];
+    if !bytes.is_empty() {
+        file.read_exact(0, &mut bytes)?;
+    }
+
+    crate::wal::restamp_header(&mut bytes, &file_id).map_err(map_wal)?;
+    file.write_all(0, &bytes)?;
+    file.sync()?;
+
+    Ok(())
 }

@@ -60,6 +60,8 @@ mod catalog;
 mod constraint;
 mod directory;
 mod error;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 mod index;
 mod keys;
 mod property;

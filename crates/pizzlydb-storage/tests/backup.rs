@@ -185,3 +185,37 @@ fn posix_backup_and_restore_round_trip() {
         Some(&b"1"[..])
     );
 }
+
+#[test]
+fn backup_gets_a_fresh_identity_and_rejects_the_source_wal() {
+    let vfs = MemoryVfs::new();
+    let db = Storage::create(&vfs, Path::new("src"), 8, Durability::Full, fill(9)).unwrap();
+    let source_id = db.file_identity();
+    let mut batch = db.begin_write().unwrap();
+    batch.put(b"a", b"1").unwrap();
+    batch.commit(Durability::Full).unwrap();
+    drop(db);
+
+    backup(&vfs, Path::new("src"), Path::new("bak")).unwrap();
+    let copy = Storage::open(&vfs, Path::new("bak"), 8, Durability::Full).unwrap();
+    let copy_id = copy.file_identity();
+    assert_ne!(copy_id, source_id);
+    drop(copy);
+
+    let source_wal = bytes(
+        &vfs,
+        &pizzlydb_storage::wal_path(Path::new("src")),
+        FileRole::Wal,
+    );
+    vfs.replace(
+        &pizzlydb_storage::wal_path(Path::new("bak")),
+        FileRole::Wal,
+        &source_wal,
+    )
+    .unwrap();
+    match Storage::open(&vfs, Path::new("bak"), 8, Durability::Full) {
+        Err(StorageError::Corrupt) => {}
+        Err(err) => panic!("expected Corrupt, got {err}"),
+        Ok(_) => panic!("expected the source WAL to be rejected"),
+    }
+}

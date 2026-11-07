@@ -13,12 +13,22 @@ homepage.workspace = true
 readme = "README.md"
 rust-version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 crc32c = { workspace = true }
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+pizzlydb-testkit = { path = "../pizzlydb-testkit" }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "storage"
+harness = false
 
 [lints]
 workspace = true

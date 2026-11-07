@@ -15,6 +15,20 @@ use crate::vfs::Vfs;
 /// the state high-water mark is either all zeros and unallocated, or a page
 /// whose header matches that id. Every tree page the root reaches is allocated.
 ///
+/// # Limitations
+///
+/// - **Offline only.** The path is opened read-write, so recovery can write
+///   the file, and nothing excludes a live writer.
+///   [Read-only open](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/015-exclusive-ownership-and-read-only-open.md)
+///   is later work.
+/// - **Every namespace.** The check is the page file, not one graph namespace.
+///   Graph agreement is `pizzlydb_graph::verify_full`. Online scrubbing is
+///   [full verification](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/107-full-verification-and-online-scrubbing.md).
+/// - **One snapshot.** The check reads one committed sequence, not every
+///   historical transaction.
+/// - **Not an in-memory script.** The input is the database file. An
+///   in-memory load belongs to [bulk load](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/110-bounded-memory-bulk-loader.md).
+///
 /// # Errors
 ///
 /// Returns [`StorageError::Corrupt`] when a header, allocation bit, or tree

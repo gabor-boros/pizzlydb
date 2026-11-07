@@ -1455,7 +1455,8 @@ fn write_u64(image: &mut [u8], offset: usize, value: u64) -> Result<(), TreeErro
     put_u64(image, offset, value).map_err(|_| TreeError::Corrupt)
 }
 
-fn read_fields(image: &[u8]) -> Result<Fields, TreeError> {
+#[allow(private_interfaces)]
+pub(crate) fn read_fields(image: &[u8]) -> Result<Fields, TreeError> {
     let header = PageHeader::decode(image).map_err(|_| TreeError::Corrupt)?;
     if read_u32(image, RESERVED_OFF)? != 0 {
         return Err(TreeError::Corrupt);
@@ -1866,7 +1867,12 @@ fn read_internal_items(image: &[u8], fields: &Fields) -> Result<Vec<InternalItem
     Ok(items)
 }
 
-fn parse_leaf_entry(image: &[u8], offset: usize, end: usize) -> Result<LeafParsed<'_>, TreeError> {
+#[allow(private_interfaces)]
+pub(crate) fn parse_leaf_entry(
+    image: &[u8],
+    offset: usize,
+    end: usize,
+) -> Result<LeafParsed<'_>, TreeError> {
     if offset.checked_add(4).ok_or(TreeError::Corrupt)? > end {
         return Err(TreeError::Corrupt);
     }
@@ -2344,6 +2350,32 @@ fn write_overflow_page<P: PageWrite>(
 
     seal_image(&mut image, PageKind::Overflow, id, header.lsn())?;
     store_page(pages, id, &image)
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fields_ok(image: &[u8]) -> bool {
+    read_fields(image).is_ok()
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn decode_leaf_entry(image: &[u8]) -> Result<(), TreeError> {
+    let _parsed = parse_leaf_entry(image, BODY_OFF, image.len())?;
+    Ok(())
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn decode_overflow_page(image: &[u8]) -> Result<(PageId, u32), TreeError> {
+    let header = PageHeader::decode(image).map_err(|_| TreeError::Corrupt)?;
+    if header.kind() != PageKind::Overflow || read_u32(image, OV_RESERVED_OFF)? != 0 {
+        return Err(TreeError::Corrupt);
+    }
+
+    let len = read_u32(image, OV_LEN_OFF)?;
+    if len == 0 || usize::try_from(len).map_err(|_| TreeError::Corrupt)? > OVERFLOW_CHUNK {
+        return Err(TreeError::Corrupt);
+    }
+
+    Ok((PageId::new(read_u64(image, OV_NEXT_OFF)?), len))
 }
 
 fn read_overflow_into<P: PageRead>(

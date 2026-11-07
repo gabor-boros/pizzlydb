@@ -43,7 +43,7 @@ This ADR records the workspace shape, the unsafe-code policy, and the dependency
 - The `forbid` level covers workspace code only. Third-party crates such as `crc32c` may contain unsafe code. `cargo deny` and `cargo audit` in CI govern them.
 - A crate that needs unsafe code, such as a future C ABI ([905](../roadmap/905-embedded-c-api.md)), requires a superseding ADR that isolates it in its own crate and states its safety invariants, tests, and reviewers (guide §11.2).
 - A new crate, such as the `pizzlydb-engine` composition root proposed by [071](../roadmap/071-embedded-engine-composition.md), is added through an amendment to the table in decision 4.
-- The guide requires a pinned toolchain (§11.2), but `rust-toolchain.toml` uses `channel = "stable"`. This ADR does not decide the pin. [005](../roadmap/005-benchmark-harness-and-baselines.md) pins it.
+- [005](../roadmap/005-benchmark-harness-and-baselines.md) pins `rust-toolchain.toml` to channel `1.98.1`. The workspace MSRV stays `1.88`. This ADR does not choose later compiler upgrades; Renovate proposes them.
 
 ## Alternatives considered
 

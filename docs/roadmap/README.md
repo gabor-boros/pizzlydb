@@ -52,9 +52,9 @@ All of these are fixable without a rewrite, and Phase 1A fixes them.
 
 - **Build and lint.** `cargo test --workspace --locked` passes. `cargo clippy --workspace --all-targets --locked -- -D warnings` is clean.
 - **CI.** `.github/workflows/ci.yml` runs on `ubuntu-latest` (x86-64) and covers formatting, Clippy, nextest, doctests, `cargo deny`, `cargo audit`, a CycloneDX SBOM, commitlint, REUSE, and workflow lint. The release workflow cross-builds an aarch64 archive but never tests on aarch64.
-- **Toolchain.** `rust-toolchain.toml` uses `channel = "stable"`, so it is not pinned (fixed by [005](005-benchmark-harness-and-baselines.md)).
+- **Toolchain.** `rust-toolchain.toml` pins channel `1.98.1`. The workspace MSRV stays `1.88`.
 - **Safety.** The workspace sets `unsafe_code = "forbid"`.
-- **Offline tools.** `backup.rs`, `verify.rs`, `inspect.rs`, and `maintain.rs` in storage, and `bulk.rs`, `salvage.rs`, and `verify.rs` in graph, implement offline backup, verification, inspection, reclaim, bulk load, and salvage. [002](002-offline-tool-identity-and-limits.md) fixes their defects.
+- **Offline tools.** `backup.rs`, `verify.rs`, `inspect.rs`, and `maintain.rs` in storage, and `bulk.rs`, `salvage.rs`, and `verify.rs` in graph, implement offline backup, verification, inspection, reclaim, bulk load, and salvage. New databases from those tools get a CSPRNG file id. Their limits are documented on the public functions. [002](002-offline-tool-identity-and-limits.md) records that work.
 
 Test inventory from `cargo test --workspace --locked`:
 

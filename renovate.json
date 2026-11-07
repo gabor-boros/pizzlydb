@@ -22,7 +22,24 @@
     "enabled": true,
     "schedule": ["before 6am on Monday"]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pin rust-toolchain.toml to an exact stable release",
+      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
+      "matchStrings": ["channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "datasourceTemplate": "github-releases",
+      "packageNameTemplate": "rust-lang/rust",
+      "extractVersionTemplate": "^(?:v)?(?<version>\\d+\\.\\d+\\.\\d+)$"
+    }
+  ],
   "packageRules": [
+    {
+      "description": "Group Rust toolchain pin updates",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["rust-lang/rust"],
+      "groupName": "rust-toolchain"
+    },
     {
       "description": "Group all GitHub Actions updates into one weekly PR",
       "matchManagers": ["github-actions"],

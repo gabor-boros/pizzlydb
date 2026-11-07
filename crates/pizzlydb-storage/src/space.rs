@@ -994,7 +994,8 @@ struct DecodedHeader {
     hints: Vec<Hint>,
 }
 
-fn decode_header(page: &[u8]) -> Result<DecodedHeader, SpaceError> {
+#[allow(private_interfaces)]
+pub(crate) fn decode_header(page: &[u8]) -> Result<DecodedHeader, SpaceError> {
     let header = PageHeader::decode(page).map_err(|_| SpaceError::Corrupt)?;
     if header.kind() != PageKind::Allocator || header.page_id() != ALLOCATOR_PAGE_ID {
         return Err(SpaceError::Corrupt);
@@ -1055,7 +1056,7 @@ fn decode_header(page: &[u8]) -> Result<DecodedHeader, SpaceError> {
     })
 }
 
-fn decode_bitmap(page: &[u8]) -> Result<Vec<u8>, SpaceError> {
+pub(crate) fn decode_bitmap(page: &[u8]) -> Result<Vec<u8>, SpaceError> {
     let header = PageHeader::decode(page).map_err(|_| SpaceError::Corrupt)?;
     if header.kind() != PageKind::Bitmap || header.page_id() != BITMAP_PAGE_ID {
         return Err(SpaceError::Corrupt);
@@ -1069,7 +1070,8 @@ struct ParsedSpill {
     entries: Vec<RetireEntry>,
 }
 
-fn decode_spill_chain(
+#[allow(private_interfaces)]
+pub(crate) fn decode_spill_chain(
     head: u64,
     images: &[SpillImage],
     high_water: u64,
@@ -1104,7 +1106,26 @@ fn decode_spill_chain(
     Ok(ordered)
 }
 
-fn decode_spill_image(image: &SpillImage, high_water: u64) -> Result<ParsedSpill, SpaceError> {
+#[cfg(feature = "fuzzing")]
+pub(crate) fn header_ok(page: &[u8]) -> bool {
+    decode_header(page).is_ok()
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn spill_chain_ok(head: u64, images: &[SpillImage], high_water: u64) -> bool {
+    decode_spill_chain(head, images, high_water).is_ok()
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn spill_image_ok(image: &SpillImage, high_water: u64) -> bool {
+    decode_spill_image(image, high_water).is_ok()
+}
+
+#[allow(private_interfaces)]
+pub(crate) fn decode_spill_image(
+    image: &SpillImage,
+    high_water: u64,
+) -> Result<ParsedSpill, SpaceError> {
     let header = PageHeader::decode(&image.bytes).map_err(|_| SpaceError::Corrupt)?;
     if header.kind() != PageKind::RetireSpill || header.page_id() != image.page_id {
         return Err(SpaceError::Corrupt);

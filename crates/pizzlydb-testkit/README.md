@@ -1,18 +1,24 @@
 # pizzlydb-testkit
 
-Reference graph model, fault harnesses, and deterministic workloads.
+Reference graph, seeded histories, benchmark datasets, and the JSON report used to compare two runs.
 
-This crate is a skeleton. The sections below describe the intended contract. The crate compiles and exports no public API.
+The crate depends on `pizzlydb-core` only. It does not open a database. Engine adapters live in the crate under test. The graph adapter is `crates/pizzlydb-graph/tests/model.rs`.
 
-## Purpose
+## Public API
 
-`pizzlydb-testkit` will hold the independent oracles used to test the database. A reference in-memory graph will recompute query results. Fault harnesses will cover process kill, durability failure, and restart. Workload generators will produce deterministic graph mutations.
+- `ReferenceGraph`, `Operation`, `History`, `StepError`, `GraphSnapshot`
+- `generate_history`, `history_strategy`, `WorkloadBias`, `PROPERTY_STEPS`
+- `Subject`, `run_history`, `minimize`, `Divergence`
+- `uniform_graph`, `power_law_graph`, `social_graph`
+- `BenchReport`, `BenchResult`, `compare_reports`, `report_to_json`, `report_from_json`
 
-The crate depends on `pizzlydb-core`. It does not replace the tests that live next to each crate.
+`compare-bench` reads two JSON reports and exits 1 when a median moves by more than the tolerance (default 0.05):
 
-## Modules
+```shell
+cargo run -p pizzlydb-testkit --bin compare-bench -- left.json right.json 0.05
+```
 
-- `reference` — the in-memory graph oracle
+The [property harness](../../docs/testing/property-harness.md) explains seeds and the crash simulator.
 
 ## License
 

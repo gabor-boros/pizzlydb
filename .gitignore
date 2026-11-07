@@ -34,3 +34,10 @@ tmp/
 
 # Database dir
 pizzlydb_data/
+fuzz/target/
+fuzz/artifacts/
+!fuzz/artifacts/.gitkeep
+fuzz/crash-*
+fuzz/leak-*
+fuzz/timeout-*
+fuzz/oom-*

@@ -1,4 +1,13 @@
 //! Durability across a crash and torn log prefixes.
+//!
+//! These tests use [`MemoryVfs`], whose crash drops every unsynced byte and
+//! keeps every synced byte. [`CrashSimVfs`](pizzlydb_storage::CrashSimVfs) is
+//! the hostile model: partial writeback, reordering, torn sectors, and
+//! directory operations lost before `sync_dir`. The all-or-nothing prefixes
+//! in this file stay on `MemoryVfs` because they assert an exact committed
+//! prefix. Partial persistence is covered by `crash_sim.rs`. A crash during
+//! `Wal::prune` can lose a `Durability::Full` commit under that model; issue
+//! 012 is the fix.
 
 #[path = "common/mod.rs"]
 mod common;

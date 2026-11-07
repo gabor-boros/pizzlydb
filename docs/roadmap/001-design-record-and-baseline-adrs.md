@@ -53,11 +53,11 @@ Two decisions are implemented but not recorded: the Rust workspace with its unsa
 
 ## Acceptance Criteria
 
-- [ ] `docs/` is tracked in git, and its index page links every subdirectory.
-- [ ] ADR-001 and ADR-003 are accepted, and the ADR index lists ADR-002 and ADR-004 through ADR-010 with their owning issues.
-- [ ] The ADR and RFC indexes define their status values and numbering, and each has a template.
-- [ ] The guide's references to `docs/specifications/` either resolve or are removed.
-- [ ] The CI docs job runs the link checker, and passes.
+- [x] `docs/` is tracked in git, and its index page links every subdirectory.
+- [x] ADR-001 and ADR-003 are accepted, and the ADR index lists ADR-002 and ADR-004 through ADR-010 with their owning issues.
+- [x] The ADR and RFC indexes define their status values and numbering, and each has a template.
+- [x] The guide's references to `docs/specifications/` either resolve or are removed.
+- [x] The CI docs job runs the link checker, and passes.
 
 ## Testing and Validation
 

@@ -2,7 +2,7 @@
 
 pizzlydb is a transactional, graph-native operational database. It maintains supported graph-query results and delivers durable, resumable subscriptions.
 
-`pizzlydb-storage`, `pizzlydb-core`, and `pizzlydb-graph` are implemented; the other workspace crates are skeletons. Each crate `README.md` describes that crate's contract. `pizzlydb-storage` is the in-house ordered key-value engine (VFS, pager, WAL, and B-tree). `pizzlydb-core` holds identifiers, values, and their ordered key encodings. `pizzlydb-txn` will hold MVCC, validation, and the logical mutation log. `pizzlydb-graph` stores records, catalog names, adjacency, properties, indexes, and constraints as keys in the storage map.
+`pizzlydb-storage`, `pizzlydb-core`, `pizzlydb-graph`, and `pizzlydb-testkit` are implemented; the other workspace crates are skeletons. Each crate `README.md` describes that crate's contract. `pizzlydb-storage` is the in-house ordered key-value engine (VFS, pager, WAL, and B-tree). `pizzlydb-core` holds identifiers, values, and their ordered key encodings. `pizzlydb-txn` will hold MVCC, validation, and the logical mutation log. `pizzlydb-graph` stores records, catalog names, adjacency, properties, indexes, and constraints as keys in the storage map.
 
 - `pizzlydb-core` — identifiers, typed values, errors, and commit sequence numbers
 - `pizzlydb-storage` — page engine and the `StorageEngine` boundary
@@ -16,7 +16,7 @@ pizzlydb is a transactional, graph-native operational database. It maintains sup
 - `pizzlydb-server` — runtime composition
 - `pizzlydb-sdk` — Rust client
 - `pizzlydb-cli` — admin, diagnostics, and query shell
-- `pizzlydb-testkit` — reference model and fault harnesses
+- `pizzlydb-testkit` — reference graph, seeded histories, and benchmark reports
 
 The `pizzlydb` binary does not open a database yet.
 
@@ -38,6 +38,7 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Run tests. Skeleton crates have no tests, so an empty run succeeds.
+# The graph property test uses 1,000 histories unless PIZZLYDB_PROPTEST_CASES is set.
 cargo nextest run --workspace --no-tests=pass
 
 # Run doctests separately
@@ -71,7 +72,7 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/). `fe
 
 ## Continuous integration and releases
 
-On pull requests and pushes to `main`, CI runs formatting, Clippy, nextest, doctests, `cargo deny` for licenses, bans, and sources, `cargo audit`, a CycloneDX SBOM artifact, commitlint, REUSE, and workflow lint.
+On pull requests and pushes to `main`, CI runs formatting, Clippy, nextest, doctests, an offline `lychee` check of `docs/`, a non-gating benchmark smoke, a 60-second fuzz smoke on nightly, `cargo deny` for licenses, bans, and sources, `cargo audit`, a CycloneDX SBOM artifact, commitlint, REUSE, and workflow lint. Decoder fuzzing is described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 [Renovate](https://docs.renovatebot.com/) opens weekly grouped pull requests for Cargo, GitHub Actions, and pre-commit updates. Install the [Renovate GitHub App](https://github.com/apps/renovate) on this repository. Non-security updates wait seven days. Security updates are not delayed.
 

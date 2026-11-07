@@ -1,6 +1,6 @@
 [package]
 name = "pizzlydb-testkit"
-description = "Reference graph model, fault harnesses, and deterministic workloads."
+description = "Reference graph model, deterministic workloads, and benchmark reports."
 categories = ["database-implementations"]
 keywords = ["pizzlydb", "database"]
 edition.workspace = true
@@ -15,6 +15,11 @@ rust-version.workspace = true
 
 [dependencies]
 pizzlydb-core = { path = "../pizzlydb-core" }
+proptest = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

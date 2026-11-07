@@ -81,7 +81,7 @@ pub struct IndexDefinition {
 }
 
 impl IndexDefinition {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(DEFINITION_LEN);
         out.extend_from_slice(&[DEFINITION_VERSION, self.scope.kind()]);
         out.extend_from_slice(self.scope.id_bytes());
@@ -90,7 +90,7 @@ impl IndexDefinition {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
         match bytes {
             [DEFINITION_VERSION, kind, .., unique @ (0 | 1)] if bytes.len() == DEFINITION_LEN => {
                 Ok(Self {
