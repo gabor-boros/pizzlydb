@@ -24,6 +24,10 @@ The `pizzlydb` binary does not open a database yet.
 cargo run -p pizzlydb-cli --quiet
 ```
 
+## Documentation
+
+The [design documentation](docs/README.md) holds the [implementation guide](docs/architecture/implementation-guide.md), the [architecture decision records](docs/adr/README.md), the [RFCs](docs/rfcs/README.md), and the [roadmap](docs/roadmap/README.md). When they disagree, the guide and accepted ADRs govern.
+
 ## Day-to-day commands
 
 ```shell
