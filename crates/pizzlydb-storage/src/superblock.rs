@@ -17,6 +17,9 @@
 //! - allocator page id `u64`
 //! - free-space map page id `u64`
 //! - B-tree root page id `u64`
+//! - write-ahead log generation `u64`
+//! - feature flags `u64`. A bit this build does not know is
+//!   [`SuperblockError::UnsupportedVersion`]
 //!
 //! Bytes after [`BODY_END`] are zero. The body has no node or edge counters
 //! and no database lineage field. The file id identifies this main file and
@@ -50,7 +53,14 @@ pub const COPY_B: PageId = PageId::new(1);
 pub const FORMAT_MAJOR: u16 = 1;
 
 /// Superblock minor version written by [`Superblock::encode`].
+///
+/// [`FORMAT_MAJOR`] and this value are format 1.0. The log generation and
+/// feature flags are part of that layout. No earlier superblock was released,
+/// so this crate does not upgrade another minor.
 pub const FORMAT_MINOR: u16 = 0;
+
+/// Feature bits this build accepts. Any other bit rejects the file.
+pub const KNOWN_FEATURE_FLAGS: u64 = 0;
 
 const FILE_ID_LEN: usize = 16;
 const FILE_ID_OFFSET: usize = HEADER_SIZE;
@@ -63,11 +73,13 @@ const LOGICAL_PAGE_COUNT_OFFSET: usize = CHECKPOINT_LSN_OFFSET + 8;
 const ALLOCATOR_PAGE_OFFSET: usize = LOGICAL_PAGE_COUNT_OFFSET + 8;
 const FREE_SPACE_MAP_OFFSET: usize = ALLOCATOR_PAGE_OFFSET + 8;
 const BTREE_ROOT_OFFSET: usize = FREE_SPACE_MAP_OFFSET + 8;
+const WAL_GENERATION_OFFSET: usize = BTREE_ROOT_OFFSET + 8;
+const FEATURE_FLAGS_OFFSET: usize = WAL_GENERATION_OFFSET + 8;
 
 /// First byte after the superblock body. Later bytes in the page are zero.
-pub const BODY_END: usize = BTREE_ROOT_OFFSET + 8;
+pub const BODY_END: usize = FEATURE_FLAGS_OFFSET + 8;
 
-const _: () = assert!(BODY_END == 100);
+const _: () = assert!(BODY_END == 116);
 const _: () = assert!(BODY_END < PAGE_SIZE);
 
 /// Failure while reading or writing a superblock page.
@@ -147,6 +159,8 @@ pub struct Superblock {
     allocator_page_id: PageId,
     free_space_map_page_id: PageId,
     btree_root_page_id: PageId,
+    wal_generation: u64,
+    feature_flags: u64,
 }
 
 impl Superblock {
@@ -193,6 +207,8 @@ impl Superblock {
             allocator_page_id,
             free_space_map_page_id,
             btree_root_page_id,
+            wal_generation: 1,
+            feature_flags: 0,
         };
 
         record.check()?;
@@ -233,6 +249,25 @@ impl Superblock {
     #[must_use]
     pub const fn free_space_map_page_id(self) -> PageId {
         self.free_space_map_page_id
+    }
+
+    /// Log generation recorded with this checkpoint.
+    #[must_use]
+    pub const fn wal_generation(self) -> u64 {
+        self.wal_generation
+    }
+
+    /// Feature bits stored in the body.
+    #[must_use]
+    pub const fn feature_flags(self) -> u64 {
+        self.feature_flags
+    }
+
+    /// Record the log generation that this checkpoint covers.
+    #[must_use]
+    pub const fn with_wal_generation(mut self, generation: u64) -> Self {
+        self.wal_generation = generation;
+        self
     }
 
     /// B-tree root page, or zero when the slot is unset.
@@ -316,6 +351,8 @@ impl Superblock {
             self.btree_root_page_id.as_u64(),
         )
         .map_err(map_codec)?;
+        put_u64(&mut page, WAL_GENERATION_OFFSET, self.wal_generation).map_err(map_codec)?;
+        put_u64(&mut page, FEATURE_FLAGS_OFFSET, self.feature_flags).map_err(map_codec)?;
 
         PageHeader::new(PageKind::Superblock, page_id, self.checkpoint_lsn)
             .encode(&mut page)
@@ -390,6 +427,11 @@ impl Superblock {
             return Err(SuperblockError::Corrupt);
         }
 
+        let feature_flags = get_u64(page, FEATURE_FLAGS_OFFSET).map_err(map_codec)?;
+        if feature_flags & !KNOWN_FEATURE_FLAGS != 0 {
+            return Err(SuperblockError::UnsupportedVersion);
+        }
+
         let record = Self {
             file_id,
             generation: get_u64(page, GENERATION_OFFSET).map_err(map_codec)?,
@@ -402,6 +444,8 @@ impl Superblock {
                 get_u64(page, FREE_SPACE_MAP_OFFSET).map_err(map_codec)?,
             ),
             btree_root_page_id: PageId::new(get_u64(page, BTREE_ROOT_OFFSET).map_err(map_codec)?),
+            wal_generation: get_u64(page, WAL_GENERATION_OFFSET).map_err(map_codec)?,
+            feature_flags,
         };
 
         record.check()?;
@@ -666,8 +710,8 @@ mod tests {
 
     use super::{
         ALLOCATOR_PAGE_OFFSET, BODY_END, BTREE_ROOT_OFFSET, CHECKPOINT_LSN_OFFSET, COPY_A, COPY_B,
-        FORMAT_MAJOR, FORMAT_MINOR, LOGICAL_PAGE_COUNT_OFFSET, MAJOR_OFFSET, MINOR_OFFSET,
-        PAGE_SIZE_OFFSET, Superblock, SuperblockError,
+        FEATURE_FLAGS_OFFSET, FORMAT_MAJOR, FORMAT_MINOR, LOGICAL_PAGE_COUNT_OFFSET, MAJOR_OFFSET,
+        MINOR_OFFSET, PAGE_SIZE_OFFSET, Superblock, SuperblockError,
     };
     use crate::codec::{put_u16, put_u32, put_u64};
     use crate::page::{Lsn, PAGE_SIZE, PageHeader, PageId, PageKind, seal};
@@ -980,7 +1024,16 @@ mod tests {
             Superblock::decode(&page, COPY_A),
             Err(SuperblockError::ChecksumMismatch)
         ));
-        assert_eq!(BODY_END, 100);
+        assert_eq!(BODY_END, 116);
+        assert_eq!(record(1, 4).feature_flags(), 0);
+
+        let mut flagged = record(1, 4).encode(COPY_A).unwrap();
+        put_u64(&mut flagged, FEATURE_FLAGS_OFFSET, 1).unwrap();
+        reseal(&mut flagged);
+        assert!(matches!(
+            Superblock::decode(&flagged, COPY_A),
+            Err(SuperblockError::UnsupportedVersion)
+        ));
         assert!(page[BODY_END..].iter().all(|&byte| byte == 0));
     }
 
@@ -994,6 +1047,28 @@ mod tests {
             Superblock::decode(&page, COPY_A),
             Err(SuperblockError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn golden_superblock_is_format_1_0() {
+        let page = record(1, 0).encode(COPY_A).unwrap();
+        assert_eq!(FORMAT_MAJOR, 1);
+        assert_eq!(FORMAT_MINOR, 0);
+        assert_eq!(
+            u16::from_le_bytes([page[MINOR_OFFSET], page[MINOR_OFFSET + 1]]),
+            0
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/compatibility/superblock-v1.0.bin");
+        if std::env::var_os("PIZZLYDB_WRITE_FIXTURE").is_some() {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, page).expect("write fixture");
+        }
+        let stored = std::fs::read(&path).expect("golden superblock");
+        assert_eq!(stored, page.as_slice());
+        let decoded = Superblock::decode(&stored, COPY_A).expect("decode golden");
+        assert_eq!(decoded.wal_generation(), 1);
+        assert_eq!(decoded.feature_flags(), 0);
     }
 
     #[test]

@@ -5,9 +5,9 @@
 //! flush. On macOS, `rss_bytes` is the current resident size (`rss_is_peak` is
 //! false). On Linux it is `VmHWM` (`rss_is_peak` is true).
 
-use std::cell::Cell;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use pizzlydb_storage::vfs_memory::MemoryFile;
@@ -20,12 +20,12 @@ const WRITES: u64 = 32;
 
 struct CountingVfs {
     inner: MemoryVfs,
-    syncs: Rc<Cell<u64>>,
+    syncs: Arc<AtomicU64>,
 }
 
 struct CountingFile {
     inner: MemoryFile,
-    syncs: Rc<Cell<u64>>,
+    syncs: Arc<AtomicU64>,
 }
 
 struct Measured {
@@ -83,10 +83,10 @@ fn counter(report: &BenchReport, name: &str, pick: impl Fn(&BenchResult) -> u64)
 }
 
 fn measure() -> Measured {
-    let syncs = Rc::new(Cell::new(0u64));
+    let syncs = Arc::new(AtomicU64::new(0));
     let vfs = CountingVfs {
         inner: MemoryVfs::new(),
-        syncs: Rc::clone(&syncs),
+        syncs: Arc::clone(&syncs),
     };
     let db = Storage::create(&vfs, Path::new("db"), 32, Durability::Full, |id| id.fill(1))
         .expect("create");
@@ -133,7 +133,7 @@ fn measure() -> Measured {
                     &samples,
                     wal,
                     wal as f64 / mutations,
-                    syncs.get(),
+                    syncs.load(Ordering::Relaxed),
                     before.read_io(),
                     0,
                     ratio(before.hits(), before.misses()),
@@ -150,7 +150,7 @@ fn measure() -> Measured {
                     pages_written,
                     wal_bytes: wal,
                     wal_bytes_per_mutation: wal as f64 / mutations,
-                    fsyncs: syncs.get(),
+                    fsyncs: syncs.load(Ordering::Relaxed),
                     rss_bytes,
                     rss_is_peak,
                     hit_ratio: ratio(after.hits(), after.misses()),
@@ -161,7 +161,7 @@ fn measure() -> Measured {
                     &cold,
                     wal_after_checkpoint,
                     0.0,
-                    syncs.get(),
+                    syncs.load(Ordering::Relaxed),
                     stats.read_io(),
                     stats.write_io(),
                     ratio(stats.hits(), stats.misses()),
@@ -173,7 +173,7 @@ fn measure() -> Measured {
                     &warm,
                     wal_after_extra,
                     0.0,
-                    syncs.get(),
+                    syncs.load(Ordering::Relaxed),
                     db.stats().read_io(),
                     db.stats().write_io(),
                     ratio(db.stats().hits(), db.stats().misses()),
@@ -306,7 +306,7 @@ impl Vfs for CountingVfs {
     ) -> Result<Self::File, VfsError> {
         Ok(CountingFile {
             inner: self.inner.open(path, role, options)?,
-            syncs: Rc::clone(&self.syncs),
+            syncs: Arc::clone(&self.syncs),
         })
     }
 
@@ -334,7 +334,7 @@ impl VfsFile for CountingFile {
 
     fn sync(&mut self) -> Result<(), VfsError> {
         self.inner.sync()?;
-        self.syncs.set(self.syncs.get().saturating_add(1));
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

@@ -11,10 +11,12 @@
 //! does not carry the root. The state page is how a commit names its root
 //! before checkpoint.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -27,12 +29,64 @@ use crate::page::{
 use crate::pager::{Pager, PagerError, PagerStats, SnapshotGuard};
 use crate::space::{INITIAL_PAGES, Space, SpaceError, SpillImage};
 use crate::superblock::{self, Superblock, SuperblockError};
-use crate::vfs::{FileRole, OpenOptions, Vfs, VfsError, VfsFile, io_error};
+use crate::vfs::{
+    FileLock, FileRole, LockMode, OpenOptions, Vfs, VfsError, VfsFile, io_error, read_only_error,
+};
 use crate::wal::{Wal, WalError};
 
 use crate::maintain;
 
 pub use crate::wal::Durability;
+
+/// Which [`BatchLimits`] field a batch exceeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitKind {
+    /// Staged keys.
+    Entries,
+    /// Staged key and value bytes.
+    StagedBytes,
+    /// Dirty page images produced while publishing.
+    DirtyPages,
+    /// Page images appended to the log by one commit.
+    WalBytes,
+}
+
+/// Upper bounds for one [`WriteBatch`].
+///
+/// Defaults are 100_000 entries, 64 MiB of staged bytes, 4_096 dirty pages,
+/// and 64 MiB of log images. A batch that crosses a bound returns
+/// [`StorageError::TransactionTooLarge`] and leaves the database unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchLimits {
+    /// Maximum distinct staged keys.
+    pub max_entries: usize,
+    /// Maximum of staged key lengths plus value lengths.
+    pub max_staged_bytes: u64,
+    /// Maximum dirty pages the publish step may build.
+    pub max_dirty_pages: usize,
+    /// Maximum bytes of page images one commit may append.
+    pub max_wal_bytes: u64,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+            max_staged_bytes: 64 * 1024 * 1024,
+            max_dirty_pages: 4_096,
+            max_wal_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Scan direction for [`ReadView::scan_range`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Ascending key order.
+    Forward,
+    /// Descending key order. The range is collected, then yielded backward.
+    Reverse,
+}
 
 /// Draw a 16-byte file identity from the operating system's CSPRNG.
 ///
@@ -89,6 +143,7 @@ const _: () = assert!(STATE_BODY_END < PAGE_SIZE);
 /// assert!(!matches!(busy, StorageError::Closed));
 /// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StorageError {
     /// The file store returned an error.
     ///
@@ -99,6 +154,15 @@ pub enum StorageError {
     /// A checksum, version field, or structural check failed.
     #[error("storage is corrupt")]
     Corrupt,
+    /// A page image failed CRC-32C. This is corruption, with the page id kept.
+    #[error("page {page_id} checksum mismatch")]
+    ChecksumMismatch { page_id: u64 },
+    /// Another opener holds the database lock.
+    #[error("database file is locked")]
+    Locked,
+    /// The filesystem cannot store more bytes.
+    #[error("no space left on the device")]
+    NoSpace,
     /// A write batch is already open.
     ///
     /// The caller is not queued. Checkpoint also returns this while a batch
@@ -112,6 +176,20 @@ pub enum StorageError {
     /// The main file or the log was written by a different format.
     #[error("unsupported storage version")]
     UnsupportedVersion,
+    /// The in-memory log index has reached its configured version cap.
+    ///
+    /// A checkpoint that can prune versions frees room. This is not a
+    /// poisoning error.
+    #[error("write-ahead log index is full")]
+    WalFull,
+    /// A write batch exceeded a configured [`BatchLimits`] field.
+    ///
+    /// The batch is not published and the handle stays open.
+    #[error("transaction exceeds the {limit:?} limit; observed {observed}")]
+    TransactionTooLarge { limit: LimitKind, observed: u64 },
+    /// A writer was refused because a configured limit is already reached.
+    #[error("storage is past its {resource} limit")]
+    ResourceExhausted { resource: &'static str },
     /// [`Storage::close`] has run, or a commit changed the log and then failed.
     ///
     /// After a failed commit the process must reopen. A successful
@@ -123,8 +201,31 @@ pub enum StorageError {
 
 impl From<VfsError> for StorageError {
     fn from(err: VfsError) -> Self {
-        Self::Io(err)
+        match err {
+            VfsError::Locked => Self::Locked,
+            VfsError::NoSpace => Self::NoSpace,
+            other => Self::Io(other),
+        }
     }
+}
+
+/// When the background task copies the log into the main file.
+///
+/// `wal_soft_bytes` starts a checkpoint. `wal_hard_bytes` makes
+/// [`Storage::begin_write`] return [`StorageError::ResourceExhausted`] while a
+/// snapshot is held and the appended log is at least that long. `max_interval`
+/// is how often the background task looks. `page_budget` is stored with the
+/// policy; one checkpoint still copies every visible page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+    /// Appended log length that starts a checkpoint.
+    pub wal_soft_bytes: u64,
+    /// Appended log length that refuses a new batch while a snapshot is held.
+    pub wal_hard_bytes: u64,
+    /// Delay between background checks.
+    pub max_interval: Duration,
+    /// Recorded page budget for one checkpoint step.
+    pub page_budget: u32,
 }
 
 /// Read and write batches over one ordered map.
@@ -224,13 +325,21 @@ pub trait StorageEngine {
 /// ```
 #[must_use = "dropping storage closes its files without checkpoint"]
 pub struct Storage<V: Vfs> {
-    inner: Rc<Inner<V>>,
+    inner: Arc<Inner<V>>,
 }
 
 struct Inner<V: Vfs> {
     pager: Pager<V::File, V::File>,
-    db: RefCell<DbState>,
+    db: Mutex<DbState>,
     durability: Durability,
+    limits: Mutex<BatchLimits>,
+    /// Released when the last handle drops. The field is read by [`Drop`].
+    #[allow(dead_code)]
+    lock: FileLock,
+    policy: Mutex<Option<CheckpointPolicy>>,
+    gate: Mutex<()>,
+    checker: Mutex<Option<JoinHandle<()>>>,
+    shutdown: AtomicBool,
 }
 
 struct DbState {
@@ -240,6 +349,8 @@ struct DbState {
     space: Space,
     writer: bool,
     closed: bool,
+    degraded: bool,
+    read_only: bool,
 }
 
 impl<V: Vfs> Storage<V> {
@@ -280,6 +391,7 @@ impl<V: Vfs> Storage<V> {
             return Err(StorageError::Io(io_error("frame count is zero")));
         }
 
+        let lock = vfs.lock(path, LockMode::Exclusive)?;
         let mut file_id = [0u8; 16];
         random(&mut file_id);
 
@@ -298,17 +410,25 @@ impl<V: Vfs> Storage<V> {
         vfs.sync_dir(parent_dir(path))?;
 
         Ok(Self {
-            inner: Rc::new(Inner {
+            inner: Arc::new(Inner {
                 pager,
-                db: RefCell::new(DbState {
+                db: Mutex::new(DbState {
                     superblock,
                     current_copy,
                     root: PageId::new(0),
                     space,
                     writer: false,
                     closed: false,
+                    degraded: false,
+                    read_only: false,
                 }),
                 durability,
+                limits: Mutex::new(BatchLimits::default()),
+                lock,
+                policy: Mutex::new(None),
+                gate: Mutex::new(()),
+                checker: Mutex::new(None),
+                shutdown: AtomicBool::new(false),
             }),
         })
     }
@@ -343,13 +463,84 @@ impl<V: Vfs> Storage<V> {
         frame_count: usize,
         durability: Durability,
     ) -> Result<Self, StorageError> {
+        Self::open_with(vfs, path, frame_count, durability, false, false)
+    }
+
+    /// Open `path` without writing it.
+    ///
+    /// The opener takes a shared lock. A read-write opener already holding the
+    /// exclusive lock makes this call return [`StorageError::Locked`].
+    /// [`Self::begin_write`] and [`Self::checkpoint`] fail. Snapshots succeed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::open`], plus [`StorageError::Locked`] when
+    /// the shared lock conflicts.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::{Durability, MemoryVfs, Storage, StorageError};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let db = Storage::create(&vfs, Path::new("ro"), 2, Durability::Full, |id| id.fill(1)).unwrap();
+    /// drop(db);
+    /// let db = Storage::open_read_only(&vfs, Path::new("ro"), 2, Durability::Full).unwrap();
+    /// assert!(matches!(db.begin_write(), Err(StorageError::Io(_))));
+    /// ```
+    pub fn open_read_only(
+        vfs: &V,
+        path: &Path,
+        frame_count: usize,
+        durability: Durability,
+    ) -> Result<Self, StorageError> {
+        Self::open_with(vfs, path, frame_count, durability, true, false)
+    }
+
+    /// Read-only open that does not take the advisory lock.
+    ///
+    /// A concurrent writer can change the file while this handle reads it.
+    /// The handle still refuses [`Self::begin_write`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::open_read_only`] other than
+    /// [`StorageError::Locked`].
+    pub fn open_read_only_diagnostic(
+        vfs: &V,
+        path: &Path,
+        frame_count: usize,
+        durability: Durability,
+    ) -> Result<Self, StorageError> {
+        Self::open_with(vfs, path, frame_count, durability, true, true)
+    }
+
+    fn open_with(
+        vfs: &V,
+        path: &Path,
+        frame_count: usize,
+        durability: Durability,
+        read_only: bool,
+        allow_concurrent_writer: bool,
+    ) -> Result<Self, StorageError> {
         if frame_count == 0 {
             return Err(StorageError::Io(io_error("frame count is zero")));
         }
 
-        let mut main = vfs.open(path, FileRole::Main, &OpenOptions::new())?;
+        let lock = if read_only && allow_concurrent_writer {
+            FileLock::noop()
+        } else if read_only {
+            vfs.lock(path, LockMode::Shared)?
+        } else {
+            vfs.lock(path, LockMode::Exclusive)?
+        };
+
+        let options = OpenOptions::new().read_only(read_only);
+        let mut main = vfs.open(path, FileRole::Main, &options)?;
         let (superblock, current_copy) = Superblock::open(&mut main).map_err(map_super)?;
-        let wal_file = vfs.open(&wal_path(path), FileRole::Wal, &OpenOptions::new())?;
+        let wal_file = vfs.open(&wal_path(path), FileRole::Wal, &options)?;
         let wal = Wal::open(wal_file, superblock.file_id()).map_err(map_wal)?;
         let checkpoint = superblock.checkpoint_lsn();
         let pager = Pager::open(main, wal, frame_count).map_err(map_pager)?;
@@ -357,17 +548,25 @@ impl<V: Vfs> Storage<V> {
         let (root, space) = load_catalog(&pager)?;
 
         Ok(Self {
-            inner: Rc::new(Inner {
+            inner: Arc::new(Inner {
                 pager,
-                db: RefCell::new(DbState {
+                db: Mutex::new(DbState {
                     superblock,
                     current_copy,
                     root,
                     space,
                     writer: false,
                     closed: false,
+                    degraded: false,
+                    read_only,
                 }),
                 durability,
+                limits: Mutex::new(BatchLimits::default()),
+                lock,
+                policy: Mutex::new(None),
+                gate: Mutex::new(()),
+                checker: Mutex::new(None),
+                shutdown: AtomicBool::new(false),
             }),
         })
     }
@@ -396,6 +595,25 @@ impl<V: Vfs> Storage<V> {
     ///
     /// assert_eq!(db.snapshot().unwrap().sequence(), Lsn::new(0));
     /// ```
+    /// Replace the bounds checked by the next [`WriteBatch`].
+    pub fn set_batch_limits(&self, limits: BatchLimits) {
+        *self.inner.limits.lock().expect("storage") = limits;
+    }
+
+    /// Sync the log without publishing a new commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Io`] when the sync fails. A failure closes the
+    /// handle.
+    pub fn sync(&self) -> Result<(), StorageError> {
+        self.ensure_open()?;
+        self.inner.pager.sync_wal().map_err(|err| {
+            self.inner.db.lock().expect("storage").closed = true;
+            map_pager(err)
+        })
+    }
+
     pub fn snapshot(&self) -> Result<ReadView<'_, V>, StorageError> {
         self.ensure_open()?;
         let snapshot = self.inner.pager.snapshot();
@@ -431,9 +649,17 @@ impl<V: Vfs> Storage<V> {
     /// assert!(db.begin_write().is_ok());
     /// ```
     pub fn begin_write(&self) -> Result<WriteBatch<V>, StorageError> {
-        let mut db = self.inner.db.borrow_mut();
+        self.enforce_wal_hard_limit()?;
+        let mut db = self.inner.db.lock().expect("storage");
         if db.closed {
             return Err(StorageError::Closed);
+        }
+        if db.read_only {
+            return Err(StorageError::Io(read_only_error()));
+        }
+
+        if db.degraded {
+            return Err(StorageError::NoSpace);
         }
         if db.writer {
             return Err(StorageError::Busy);
@@ -441,9 +667,12 @@ impl<V: Vfs> Storage<V> {
         db.writer = true;
         drop(db);
 
+        let limits = *self.inner.limits.lock().expect("storage");
         Ok(WriteBatch {
-            inner: Rc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
             stage: BTreeMap::new(),
+            staged_bytes: 0,
+            limits,
             committed: false,
         })
     }
@@ -474,7 +703,7 @@ impl<V: Vfs> Storage<V> {
     /// assert!(lsn.as_u64() > 0);
     /// ```
     pub fn atomic_write_sync(&self, batch: WriteBatch<V>) -> Result<Lsn, StorageError> {
-        if !Rc::ptr_eq(&self.inner, &batch.inner) {
+        if !Arc::ptr_eq(&self.inner, &batch.inner) {
             return Err(StorageError::Corrupt);
         }
         let durability = self.inner.durability;
@@ -513,10 +742,14 @@ impl<V: Vfs> Storage<V> {
     /// db.checkpoint().unwrap();
     /// ```
     pub fn checkpoint(&self) -> Result<(), StorageError> {
+        let _gate = self.inner.gate.lock().expect("storage");
         {
-            let db = self.inner.db.borrow();
+            let db = self.inner.db.lock().expect("storage");
             if db.closed {
                 return Err(StorageError::Closed);
+            }
+            if db.read_only {
+                return Err(StorageError::Io(read_only_error()));
             }
             if db.writer {
                 return Err(StorageError::Busy);
@@ -548,8 +781,9 @@ impl<V: Vfs> Storage<V> {
         }
         self.inner.pager.sync_main().map_err(map_pager)?;
 
+        let wal_generation = self.inner.pager.wal_generation();
         let (file_id, generation, current) = {
-            let db = self.inner.db.borrow();
+            let db = self.inner.db.lock().expect("storage");
             (
                 db.superblock.file_id(),
                 db.superblock.generation(),
@@ -568,7 +802,8 @@ impl<V: Vfs> Storage<V> {
             PageId::new(0),
             root,
         )
-        .map_err(map_super)?;
+        .map_err(map_super)?
+        .with_wal_generation(wal_generation);
 
         let image = record.encode(next_copy).map_err(map_super)?;
         self.inner
@@ -578,13 +813,13 @@ impl<V: Vfs> Storage<V> {
 
         self.inner.pager.sync_main().map_err(map_pager)?;
         {
-            let mut db = self.inner.db.borrow_mut();
+            let mut db = self.inner.db.lock().expect("storage");
             db.superblock = record;
             db.current_copy = next_copy;
         }
 
         if let Err(err) = self.inner.pager.prune_wal(visible) {
-            self.inner.db.borrow_mut().closed = true;
+            self.inner.db.lock().expect("storage").closed = true;
             return Err(map_pager(err));
         }
         drop(guard);
@@ -619,16 +854,93 @@ impl<V: Vfs> Storage<V> {
     /// assert!(matches!(db.snapshot(), Err(StorageError::Closed)));
     /// ```
     pub fn close(&self) -> Result<(), StorageError> {
-        let mut db = self.inner.db.borrow_mut();
-        if db.closed {
+        let policy = self.inner.policy.lock().expect("storage").is_some();
+        let (closed, writer, read_only) = {
+            let db = self.inner.db.lock().expect("storage");
+            (db.closed, db.writer, db.read_only)
+        };
+        if closed {
             return Err(StorageError::Closed);
         }
+        if policy && !writer && !read_only {
+            self.checkpoint()?;
+        }
+        self.inner.shutdown.store(true, Ordering::Relaxed);
+        let mut db = self.inner.db.lock().expect("storage");
         db.closed = true;
         Ok(())
     }
 
+    /// Install `policy` and start the background checker if it is not running.
+    ///
+    /// The task calls [`Self::checkpoint`] when the appended log reaches
+    /// `wal_soft_bytes`. Dropping the last handle lets the task exit.
+    pub fn set_checkpoint_policy(&self, policy: CheckpointPolicy)
+    where
+        V: 'static,
+    {
+        *self.inner.policy.lock().expect("storage") = Some(policy);
+        self.ensure_checkpointer();
+    }
+
+    /// Checkpoint when the installed policy says the log is past its soft limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::checkpoint`] when a checkpoint is due.
+    pub fn poll_checkpoint(&self) -> Result<(), StorageError> {
+        let policy = *self.inner.policy.lock().expect("storage");
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+
+        let appended = self.inner.pager.wal_appended_bytes().map_err(map_pager)?;
+        if appended >= policy.wal_soft_bytes {
+            self.checkpoint()?;
+        }
+
+        Ok(())
+    }
+
+    /// Frames applied from the log when this handle was opened.
+    #[must_use]
+    pub fn recovered_wal_frames(&self) -> u64 {
+        self.inner.pager.recovered_frames()
+    }
+
+    fn enforce_wal_hard_limit(&self) -> Result<(), StorageError> {
+        let policy = *self.inner.policy.lock().expect("storage");
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+
+        let appended = self.inner.pager.wal_appended_bytes().map_err(map_pager)?;
+        if appended < policy.wal_hard_bytes {
+            return Ok(());
+        }
+
+        if self.inner.pager.snapshot_count() > 0 {
+            return Err(StorageError::ResourceExhausted { resource: "wal" });
+        }
+
+        self.checkpoint()?;
+        Ok(())
+    }
+
+    fn ensure_checkpointer(&self)
+    where
+        V: 'static,
+    {
+        let mut slot = self.inner.checker.lock().expect("storage");
+        if slot.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        *slot = Some(thread::spawn(move || checker_loop(weak)));
+    }
+
     fn ensure_open(&self) -> Result<(), StorageError> {
-        if self.inner.db.borrow().closed {
+        if self.inner.db.lock().expect("storage").closed {
             Err(StorageError::Closed)
         } else {
             Ok(())
@@ -636,12 +948,12 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub(crate) fn reclaim_horizon(&self) -> Result<bool, StorageError> {
-        if self.inner.db.borrow().closed {
+        if self.inner.db.lock().expect("storage").closed {
             return Ok(false);
         }
 
         let horizon = self.inner.pager.snapshot_lsn();
-        let mut db = self.inner.db.borrow_mut();
+        let mut db = self.inner.db.lock().expect("storage");
         if db.closed {
             return Ok(false);
         }
@@ -656,7 +968,7 @@ impl<V: Vfs> Storage<V> {
     }
 
     fn write_reclaimed_space(&self, lsn: Lsn) -> Result<(), StorageError> {
-        let encoded = self.inner.db.borrow().space.encode();
+        let encoded = self.inner.db.lock().expect("storage").space.encode();
         let mut header = encoded.header;
         let mut bitmap = encoded.bitmap;
         stamp(&mut header, lsn)?;
@@ -669,6 +981,15 @@ impl<V: Vfs> Storage<V> {
             .pager
             .write_page(BITMAP_PAGE_ID, &bitmap)
             .map_err(map_pager)?;
+
+        for extra in encoded.extra_bitmaps {
+            let mut bytes = extra.bytes;
+            stamp(&mut bytes, lsn)?;
+            self.inner
+                .pager
+                .write_page(extra.page_id, &bytes)
+                .map_err(map_pager)?;
+        }
 
         for spill in encoded.spills {
             let mut bytes = spill.bytes;
@@ -714,7 +1035,12 @@ impl<V: Vfs> Storage<V> {
     /// ```
     #[must_use]
     pub fn logical_page_count(&self) -> u64 {
-        self.inner.db.borrow().superblock.logical_page_count()
+        self.inner
+            .db
+            .lock()
+            .expect("storage")
+            .superblock
+            .logical_page_count()
     }
 
     /// Buffer-pool counters since this handle was opened.
@@ -761,11 +1087,11 @@ impl<V: Vfs> Storage<V> {
     /// ```
     #[must_use]
     pub fn file_identity(&self) -> [u8; 16] {
-        self.inner.db.borrow().superblock.file_id()
+        self.inner.db.lock().expect("storage").superblock.file_id()
     }
 
     pub(crate) fn superblock_slots(&self) -> (PageId, PageId) {
-        let db = self.inner.db.borrow();
+        let db = self.inner.db.lock().expect("storage");
         (
             db.superblock.allocator_page_id(),
             db.superblock.free_space_map_page_id(),
@@ -773,7 +1099,7 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub(crate) fn committed_space(&self) -> Space {
-        self.inner.db.borrow().space.clone()
+        self.inner.db.lock().expect("storage").space.clone()
     }
 
     pub(crate) fn verify_tree(
@@ -794,12 +1120,17 @@ impl<V: Vfs> Storage<V> {
 
     #[cfg(test)]
     fn is_page_allocated(&self, id: PageId) -> bool {
-        self.inner.db.borrow().space.is_allocated(id)
+        self.inner
+            .db
+            .lock()
+            .expect("storage")
+            .space
+            .is_allocated(id)
     }
 
     #[cfg(test)]
     fn retired_pages(&self) -> Vec<PageId> {
-        let space = &self.inner.db.borrow().space;
+        let space = &self.inner.db.lock().expect("storage").space;
         (0..space.high_water())
             .map(PageId::new)
             .filter(|id| space.is_retired(*id))
@@ -808,7 +1139,7 @@ impl<V: Vfs> Storage<V> {
 
     #[cfg(test)]
     fn reuse_candidate(&self, retired: &[PageId]) -> Option<PageId> {
-        let mut space = self.inner.db.borrow().space.clone();
+        let mut space = self.inner.db.lock().expect("storage").space.clone();
         for _ in 0..space.high_water() {
             let id = space.allocate(PageKind::BTreeLeaf).ok()?;
             if retired.contains(&id) {
@@ -980,6 +1311,85 @@ impl<'a, V: Vfs> ReadView<'a, V> {
             view: self,
             cursor,
             done: false,
+            end: None,
+            reverse: None,
+        })
+    }
+
+    /// Scan keys in `[start, end)`.
+    ///
+    /// `end` of [`None`] means there is no upper bound. [`Direction::Reverse`]
+    /// collects the range and then yields it from the last key. The count is
+    /// exact, so [`Self::estimate_range`] reports equal lower and upper bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Closed`] when the handle is shut, and
+    /// [`StorageError::Corrupt`] when a page on the path is invalid.
+    pub fn scan_range<'b>(
+        &'b self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        direction: Direction,
+    ) -> Result<Scan<'b, 'a, V>, StorageError> {
+        if direction == Direction::Reverse {
+            let mut rows = Vec::new();
+            let mut forward = self.scan_range(start, end, Direction::Forward)?;
+            for item in forward.by_ref() {
+                rows.push(item?);
+            }
+            return Ok(Scan {
+                view: self,
+                cursor: Cursor::empty(),
+                done: false,
+                end: None,
+                reverse: Some(rows),
+            });
+        }
+
+        self.ensure_open()?;
+        let root = self.lookup_root()?;
+        let pages = self.pages();
+        let cursor = BTree::from_root(root)
+            .scan_from(&pages, start)
+            .map_err(map_tree)?;
+
+        Ok(Scan {
+            view: self,
+            cursor,
+            done: false,
+            end: end.map(|bound| bound.to_vec()),
+            reverse: None,
+        })
+    }
+
+    /// Exact key count and byte size of `[start, end)`.
+    ///
+    /// The lower and upper key bounds are equal. Bytes count stored key and
+    /// value lengths, not page images.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::scan_range`].
+    pub fn estimate_range(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<RangeEstimate, StorageError> {
+        let mut keys = 0u64;
+        let mut bytes = 0u64;
+        for item in self.scan_range(start, end, Direction::Forward)? {
+            let (key, value) = item?;
+            keys = keys.saturating_add(1);
+            bytes = bytes
+                .saturating_add(key.len() as u64)
+                .saturating_add(value.len() as u64);
+        }
+
+        Ok(RangeEstimate {
+            keys_lower: keys,
+            keys_upper: keys,
+            bytes,
         })
     }
 
@@ -1044,6 +1454,21 @@ pub struct Scan<'a, 'db, V: Vfs> {
     view: &'a ReadView<'db, V>,
     cursor: Cursor,
     done: bool,
+    end: Option<Vec<u8>>,
+    reverse: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+/// Key count and stored byte size of a range.
+///
+/// `keys_lower` and `keys_upper` are equal: the scan counted every key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeEstimate {
+    /// Smallest key count consistent with the tree.
+    pub keys_lower: u64,
+    /// Largest key count consistent with the tree.
+    pub keys_upper: u64,
+    /// Sum of key and value lengths.
+    pub bytes: u64,
 }
 
 impl<V: Vfs> Iterator for Scan<'_, '_, V> {
@@ -1053,14 +1478,28 @@ impl<V: Vfs> Iterator for Scan<'_, '_, V> {
         if self.done {
             return None;
         }
-        if self.view.storage.inner.db.borrow().closed {
+        if self.view.storage.inner.db.lock().expect("storage").closed {
             self.done = true;
             return Some(Err(StorageError::Closed));
         }
 
+        if let Some(rows) = &mut self.reverse {
+            return rows.pop().map(Ok);
+        }
+
         let pages = self.view.pages();
         match self.cursor.next(&pages) {
-            Ok(Some(entry)) => Some(Ok((entry.key.to_vec(), entry.value.to_vec()))),
+            Ok(Some(entry)) => {
+                if self
+                    .end
+                    .as_ref()
+                    .is_some_and(|end| entry.key >= end.as_slice())
+                {
+                    self.done = true;
+                    return None;
+                }
+                Some(Ok((entry.key.to_vec(), entry.value.to_vec())))
+            }
             Ok(None) => {
                 self.done = true;
                 None
@@ -1100,8 +1539,10 @@ impl<V: Vfs> Iterator for Scan<'_, '_, V> {
 /// ```
 #[must_use = "dropping the batch rolls it back"]
 pub struct WriteBatch<V: Vfs> {
-    inner: Rc<Inner<V>>,
+    inner: Arc<Inner<V>>,
     stage: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    staged_bytes: u64,
+    limits: BatchLimits,
     committed: bool,
 }
 
@@ -1137,8 +1578,7 @@ impl<V: Vfs> WriteBatch<V> {
         if key.len() > MAX_KEY_LEN || value.len() > MAX_VALUE_LEN {
             return Err(StorageError::Full);
         }
-        self.stage.insert(key.to_vec(), Some(value.to_vec()));
-        Ok(())
+        self.stage_change(key, Some(value))
     }
 
     /// Stage removal of `key`.
@@ -1173,7 +1613,90 @@ impl<V: Vfs> WriteBatch<V> {
         if key.len() > MAX_KEY_LEN {
             return Err(StorageError::Full);
         }
-        self.stage.insert(key.to_vec(), None);
+        self.stage_change(key, None)
+    }
+
+    /// Stage removal of every committed or staged key in `[start, end)`.
+    ///
+    /// The deletion is applied on commit as one key at a time. A range that
+    /// covers a whole subtree still rewrites the pages that hold those keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::TransactionTooLarge`] when the staged tombstones
+    /// cross [`BatchLimits`], and [`StorageError::Closed`] when the handle is shut.
+    pub fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<(), StorageError> {
+        self.ensure_open()?;
+        if start >= end {
+            return Ok(());
+        }
+
+        let keys: Vec<Vec<u8>> = self
+            .stage
+            .range(start.to_vec()..end.to_vec())
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in keys {
+            self.stage_change(&key, None)?;
+        }
+
+        let storage = Storage {
+            inner: Arc::clone(&self.inner),
+        };
+        let view = storage.snapshot()?;
+
+        let mut found = Vec::new();
+        for item in view.scan_range(Some(start), Some(end), Direction::Forward)? {
+            found.push(item?.0);
+        }
+        drop(view);
+
+        for key in found {
+            self.stage_change(&key, None)?;
+        }
+
+        Ok(())
+    }
+
+    fn stage_change(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<(), StorageError> {
+        let incoming =
+            (key.len() as u64).saturating_add(value.map(|bytes| bytes.len() as u64).unwrap_or(0));
+
+        let previous = self.stage.get(key).map(|stored| {
+            (key.len() as u64)
+                .saturating_add(stored.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0))
+        });
+
+        let next_entries = if previous.is_some() {
+            self.stage.len()
+        } else {
+            self.stage.len().saturating_add(1)
+        };
+
+        if next_entries > self.limits.max_entries {
+            return Err(StorageError::TransactionTooLarge {
+                limit: LimitKind::Entries,
+                observed: u64::try_from(next_entries).unwrap_or(u64::MAX),
+            });
+        }
+
+        let next_bytes = self
+            .staged_bytes
+            .saturating_sub(previous.unwrap_or(0))
+            .saturating_add(incoming);
+
+        if next_bytes > self.limits.max_staged_bytes {
+            return Err(StorageError::TransactionTooLarge {
+                limit: LimitKind::StagedBytes,
+                observed: next_bytes,
+            });
+        }
+
+        self.staged_bytes = next_bytes;
+        self.stage
+            .insert(key.to_vec(), value.map(|bytes| bytes.to_vec()));
+
         Ok(())
     }
 
@@ -1219,7 +1742,7 @@ impl<V: Vfs> WriteBatch<V> {
     }
 
     fn ensure_open(&self) -> Result<(), StorageError> {
-        if self.inner.db.borrow().closed {
+        if self.inner.db.lock().expect("storage").closed {
             Err(StorageError::Closed)
         } else {
             Ok(())
@@ -1227,13 +1750,14 @@ impl<V: Vfs> WriteBatch<V> {
     }
 
     fn publish(&mut self, durability: Durability) -> Result<Lsn, StorageError> {
+        let _gate = self.inner.gate.lock().expect("storage");
         self.ensure_open()?;
         if self.stage.is_empty() {
             return Ok(self.inner.pager.committed_lsn());
         }
 
         let (root, space) = {
-            let db = self.inner.db.borrow();
+            let db = self.inner.db.lock().expect("storage");
             (db.root, db.space.clone())
         };
         let base = self.inner.pager.committed_lsn();
@@ -1242,9 +1766,17 @@ impl<V: Vfs> WriteBatch<V> {
         let mut overlay = Overlay::open(&self.inner.pager, space.clone(), next);
         let mut tree = BTree::from_root(root);
         for (key, value) in &self.stage {
-            match value {
-                Some(bytes) => tree.insert(&mut overlay, key, bytes).map_err(map_tree)?,
-                None => tree.remove(&mut overlay, key).map_err(map_tree)?,
+            let result = match value {
+                Some(bytes) => tree.insert(&mut overlay, key, bytes),
+                None => tree.remove(&mut overlay, key),
+            };
+
+            if let Err(err) = result {
+                let mapped = map_tree(err);
+                if matches!(mapped, StorageError::Io(_)) {
+                    self.inner.db.lock().expect("storage").closed = true;
+                }
+                return Err(mapped);
             }
         }
 
@@ -1256,20 +1788,43 @@ impl<V: Vfs> WriteBatch<V> {
         overlay.store_space_images();
         overlay.store_state(tree.root())?;
         let images = overlay.stamped(next)?;
+        let dirty_pages = overlay.dirty.len();
         let new_space = overlay.space.clone();
         let new_root = tree.root();
         drop(overlay);
 
+        if dirty_pages > self.limits.max_dirty_pages {
+            return Err(StorageError::TransactionTooLarge {
+                limit: LimitKind::DirtyPages,
+                observed: u64::try_from(dirty_pages).unwrap_or(u64::MAX),
+            });
+        }
+
+        let wal_bytes = (images.len() as u64).saturating_mul(PAGE_SIZE as u64);
+        if wal_bytes > self.limits.max_wal_bytes {
+            return Err(StorageError::TransactionTooLarge {
+                limit: LimitKind::WalBytes,
+                observed: wal_bytes,
+            });
+        }
+
         match self.inner.pager.commit_pages(&images, durability) {
             Ok(lsn) => {
-                let mut db = self.inner.db.borrow_mut();
+                let mut db = self.inner.db.lock().expect("storage");
                 db.root = new_root;
                 db.space = new_space;
                 Ok(lsn)
             }
             Err(err) => {
-                self.inner.db.borrow_mut().closed = true;
-                Err(map_pager(err))
+                let mapped = map_pager(err);
+                let mut db = self.inner.db.lock().expect("storage");
+                if matches!(mapped, StorageError::NoSpace) {
+                    db.degraded = true;
+                } else {
+                    db.closed = true;
+                }
+
+                Err(mapped)
             }
         }
     }
@@ -1281,7 +1836,7 @@ impl<V: Vfs> Drop for WriteBatch<V> {
         // Either way the stage is discarded with this value, and the writer
         // lock is released. The published map is left in place.
         let _published = self.committed;
-        self.inner.db.borrow_mut().writer = false;
+        self.inner.db.lock().expect("storage").writer = false;
     }
 }
 
@@ -1322,10 +1877,7 @@ impl<M: VfsFile, W: VfsFile> PageRead for SnapshotPages<'_, M, W> {
         Self: 'a;
 
     fn pin(&self, id: PageId) -> Result<Self::Pin<'_>, TreeError> {
-        let pin = self
-            .pager
-            .pin(id, self.lsn)
-            .map_err(|_| TreeError::Corrupt)?;
+        let pin = self.pager.pin(id, self.lsn).map_err(map_pager_tree)?;
         Ok(pin.bytes().to_vec())
     }
 }
@@ -1360,7 +1912,7 @@ impl<'a, M: VfsFile, W: VfsFile> Overlay<'a, M, W> {
         let pin = self
             .pager
             .pin(id, self.snapshot.lsn())
-            .map_err(|_| TreeError::Corrupt)?;
+            .map_err(map_pager_tree)?;
 
         copy_image(&pin.bytes()).map_err(|_| TreeError::Corrupt)
     }
@@ -1374,6 +1926,11 @@ impl<'a, M: VfsFile, W: VfsFile> Overlay<'a, M, W> {
         let encoded = self.space.encode();
         self.insert(ALLOCATOR_PAGE_ID, encoded.header);
         self.insert(BITMAP_PAGE_ID, encoded.bitmap);
+
+        for extra in encoded.extra_bitmaps {
+            self.insert(extra.page_id, extra.bytes);
+        }
+
         for spill in encoded.spills {
             self.insert(spill.page_id, spill.bytes);
         }
@@ -1388,6 +1945,7 @@ impl<'a, M: VfsFile, W: VfsFile> Overlay<'a, M, W> {
     fn stamped(&mut self, lsn: Lsn) -> Result<Vec<(PageId, [u8; PAGE_SIZE])>, StorageError> {
         let ids: Vec<PageId> = self.dirty.iter().copied().collect();
         let mut out = Vec::with_capacity(ids.len());
+
         for id in ids {
             let image = self.images.get_mut(&id).ok_or(StorageError::Corrupt)?;
             put_u64(image, LSN_OFFSET, lsn.as_u64()).map_err(|_| StorageError::Corrupt)?;
@@ -1506,7 +2064,9 @@ fn load_catalog<M: VfsFile, W: VfsFile>(
     let bitmap = read_page(pager, lsn, BITMAP_PAGE_ID)?;
     let spills = read_spills(pager, lsn, &header)?;
 
-    let space = Space::load(&header, &bitmap, &spills).map_err(|_| StorageError::Corrupt)?;
+    let extras = read_bitmap_chain(pager, lsn, &bitmap)?;
+    let space =
+        Space::load(&header, &bitmap, &spills, &extras).map_err(|_| StorageError::Corrupt)?;
     if space.high_water() != high_water {
         return Err(StorageError::Corrupt);
     }
@@ -1521,6 +2081,30 @@ fn load_catalog<M: VfsFile, W: VfsFile>(
 
     drop(guard);
     Ok((root, space))
+}
+
+fn read_bitmap_chain<M: VfsFile, W: VfsFile>(
+    pager: &Pager<M, W>,
+    lsn: Lsn,
+    first: &[u8; PAGE_SIZE],
+) -> Result<Vec<SpillImage>, StorageError> {
+    let mut next = get_u64(first, PAGE_SIZE - 8).map_err(|_| StorageError::Corrupt)?;
+    let mut out = Vec::new();
+    let mut hops = 0usize;
+
+    while next != 0 {
+        hops = hops.saturating_add(1);
+        if hops > 65_536 {
+            return Err(StorageError::Corrupt);
+        }
+
+        let page_id = PageId::new(next);
+        let bytes = read_page(pager, lsn, page_id)?;
+        next = get_u64(&bytes, PAGE_SIZE - 8).map_err(|_| StorageError::Corrupt)?;
+        out.push(SpillImage { page_id, bytes });
+    }
+
+    Ok(out)
 }
 
 fn read_spills<M: VfsFile, W: VfsFile>(
@@ -1656,28 +2240,72 @@ fn map_space_tree(err: SpaceError) -> TreeError {
     }
 }
 
+fn map_pager_tree(err: PagerError) -> TreeError {
+    match err {
+        PagerError::Io(_) | PagerError::Wal(crate::wal::WalError::Io(_)) => TreeError::Io,
+        _ => TreeError::Corrupt,
+    }
+}
+
 fn map_tree(err: TreeError) -> StorageError {
     match err {
         TreeError::Full | TreeError::KeyTooLarge | TreeError::ValueTooLarge => StorageError::Full,
+        TreeError::Io => StorageError::Io(io_error("page read failed")),
         TreeError::Corrupt | TreeError::DoubleFree => StorageError::Corrupt,
     }
 }
 
 pub(crate) fn map_pager(err: PagerError) -> StorageError {
     match err {
+        PagerError::Io(VfsError::NoSpace) => StorageError::NoSpace,
+        PagerError::Io(VfsError::Locked) => StorageError::Locked,
         PagerError::Io(err) => StorageError::Io(err),
         PagerError::Wal(err) => map_wal(err),
-        PagerError::PoolExhausted => StorageError::Io(io_error("buffer pool exhausted")),
-        PagerError::ChecksumMismatch
-        | PagerError::Corrupt
+        PagerError::PoolExhausted => StorageError::ResourceExhausted {
+            resource: "buffer-pool",
+        },
+        PagerError::ChecksumMismatch { page_id } => StorageError::ChecksumMismatch { page_id },
+        PagerError::Corrupt
         | PagerError::SnapshotNotFound
         | PagerError::Shared
         | PagerError::NotDirty => StorageError::Corrupt,
     }
 }
 
+fn checker_loop<V: Vfs>(weak: Weak<Inner<V>>) {
+    while let Some(inner) = weak.upgrade() {
+        if inner.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let policy = *inner.policy.lock().expect("storage");
+        let wait = policy
+            .map(|policy| policy.max_interval)
+            .unwrap_or(Duration::from_secs(1));
+
+        if let Some(policy) = policy {
+            let appended = inner.pager.wal_appended_bytes().unwrap_or(0);
+            if appended >= policy.wal_soft_bytes {
+                let storage = Storage {
+                    inner: Arc::clone(&inner),
+                };
+                let _ = storage.checkpoint();
+            }
+        }
+        drop(inner);
+
+        thread::sleep(if wait.is_zero() {
+            Duration::from_millis(10)
+        } else {
+            wait
+        });
+    }
+}
+
 pub(crate) fn map_wal(err: WalError) -> StorageError {
     match err {
+        WalError::Io(VfsError::NoSpace) => StorageError::NoSpace,
+        WalError::Io(VfsError::Locked) => StorageError::Locked,
         WalError::Io(err) => StorageError::Io(err),
         WalError::UnsupportedVersion => StorageError::UnsupportedVersion,
         WalError::Torn
@@ -1685,6 +2313,7 @@ pub(crate) fn map_wal(err: WalError) -> StorageError {
         | WalError::BadMagic
         | WalError::Corrupt
         | WalError::FileIdMismatch => StorageError::Corrupt,
+        WalError::Full => StorageError::WalFull,
     }
 }
 

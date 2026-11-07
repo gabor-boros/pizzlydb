@@ -159,6 +159,9 @@ pub(crate) enum TreeError {
     /// The page id is already free.
     #[error("page is already free")]
     DoubleFree,
+    /// The pager could not read a page.
+    #[error("page read failed")]
+    Io,
 }
 
 /// Shared access to sealed page images.
@@ -1202,7 +1205,7 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             page_id: PageId::new(0),
             index: 0,
@@ -2262,6 +2265,10 @@ fn sibling_child<P: PageRead>(
 }
 
 fn set_parent<P: PageWrite>(pages: &mut P, id: PageId, parent: PageId) -> Result<(), TreeError> {
+    let image = load_page(pages, id)?;
+    if read_u64(&image, PARENT_OFF)? == parent.as_u64() {
+        return Ok(());
+    }
     update_u64(pages, id, PARENT_OFF, parent.as_u64())
 }
 

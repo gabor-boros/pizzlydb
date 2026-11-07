@@ -1,6 +1,5 @@
 //! Backup, restore, publish, and inspect.
 
-use std::cell::Cell;
 use std::path::Path;
 
 use pizzlydb_storage::{
@@ -88,7 +87,7 @@ fn inspect_does_not_change_the_file_length() {
 
 struct FailRename {
     inner: MemoryVfs,
-    renames: Cell<usize>,
+    renames: std::sync::atomic::AtomicUsize,
 }
 
 impl Vfs for FailRename {
@@ -108,7 +107,9 @@ impl Vfs for FailRename {
     }
 
     fn rename(&self, _from: &Path, _to: &Path, _role: FileRole) -> Result<(), VfsError> {
-        self.renames.set(self.renames.get() + 1);
+        self.renames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Err(VfsError::Io {
             source: std::io::Error::other("rename failed"),
         })
@@ -123,7 +124,7 @@ impl Vfs for FailRename {
 fn publish_fault_on_the_first_rename_leaves_the_destination() {
     let vfs = FailRename {
         inner: MemoryVfs::new(),
-        renames: Cell::new(0),
+        renames: std::sync::atomic::AtomicUsize::new(0),
     };
     let db = Storage::create(&vfs, Path::new("live"), 8, Durability::Full, fill(1)).unwrap();
     let mut batch = db.begin_write().unwrap();
@@ -136,7 +137,7 @@ fn publish_fault_on_the_first_rename_leaves_the_destination() {
 
     let err = publish(&vfs, Path::new("next"), Path::new("live")).unwrap_err();
     assert!(matches!(err, StorageError::Io(_)));
-    assert_eq!(vfs.renames.get(), 1);
+    assert_eq!(vfs.renames.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(bytes(&vfs, Path::new("live"), FileRole::Main), before);
     let live = Storage::open(&vfs, Path::new("live"), 8, Durability::Full).unwrap();
     assert_eq!(

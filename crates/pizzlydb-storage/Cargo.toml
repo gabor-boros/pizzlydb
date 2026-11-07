@@ -19,6 +19,7 @@ fuzzing = []
 [dependencies]
 crc32c = { workspace = true }
 getrandom = { workspace = true }
+rustix = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

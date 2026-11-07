@@ -270,7 +270,7 @@ pub(crate) fn verify_and_publish<V: Vfs>(
 ) -> Result<(), GraphError> {
     let graph = GraphStore::new(namespace);
     {
-        let opened = Storage::open(vfs, partial, FRAME_COUNT, Durability::Full)?;
+        let opened = Storage::open_read_only(vfs, partial, FRAME_COUNT, Durability::Full)?;
         let view = opened.snapshot()?;
         verify_full(&graph, &view)?;
     }
@@ -782,7 +782,7 @@ fn open_readable<V: Vfs>(
     source: &Path,
     destination: &Path,
 ) -> Result<(Storage<V>, bool), GraphError> {
-    match Storage::open(vfs, source, FRAME_COUNT, Durability::Full) {
+    match Storage::open_read_only(vfs, source, FRAME_COUNT, Durability::Full) {
         Ok(db) => Ok((db, false)),
         Err(err) => {
             let copy = suffix_path(destination, ".source");

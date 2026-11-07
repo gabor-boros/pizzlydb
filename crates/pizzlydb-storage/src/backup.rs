@@ -13,7 +13,7 @@ use crate::engine::{
 };
 use crate::page::{Lsn, PAGE_SIZE, PageId};
 use crate::superblock::{COPY_A, COPY_B, Superblock};
-use crate::vfs::{FileRole, OpenOptions, Vfs, VfsError, VfsFile};
+use crate::vfs::{FileRole, LockMode, OpenOptions, Vfs, VfsError, VfsFile};
 use crate::wal::Wal;
 
 /// Pages copied for one snapshot.
@@ -99,7 +99,7 @@ pub fn backup<V: Vfs>(
         return Err(StorageError::Io(VfsError::InvalidPath));
     }
 
-    let db = Storage::open(vfs, source, 8, crate::Durability::Full)?;
+    let db = Storage::open_read_only(vfs, source, 8, crate::Durability::Full)?;
     let view = db.snapshot()?;
     let lsn = view.sequence();
     let state = db.page_image(lsn, STATE_PAGE_ID)?;
@@ -285,6 +285,7 @@ pub fn export_checkpoint<V: Vfs>(
         return Err(StorageError::Io(VfsError::InvalidPath));
     }
 
+    let _lock = vfs.lock(source, LockMode::Shared)?;
     let mut file = vfs.open(source, FileRole::Main, &OpenOptions::new().read_only(true))?;
     let mut first = [0u8; PAGE_SIZE];
     let mut second = [0u8; PAGE_SIZE];
@@ -479,7 +480,8 @@ fn restamp_superblock(
         record.free_space_map_page_id(),
         record.btree_root_page_id(),
     )
-    .map_err(map_super)?;
+    .map_err(map_super)?
+    .with_wal_generation(record.wal_generation());
 
     record.encode(id).map(Some).map_err(map_super)
 }

@@ -33,7 +33,7 @@ fn commit(
 }
 
 #[test]
-fn wal_prune_partial_persistence_loses_a_full_commit_or_corrupts() {
+fn wal_reset_does_not_lose_a_full_commit() {
     let config = CrashSimConfig {
         torn_probability: 0.25,
         persist: PersistMode::Random,
@@ -87,13 +87,10 @@ fn wal_prune_partial_persistence_loses_a_full_commit_or_corrupts() {
         },
     );
     assert!(
-        lost,
-        "no crash lost a Durability::Full commit; issue 012 should keep this assertion true until the rewrite is crash-safe"
+        !lost,
+        "a Durability::Full commit was lost or the store would not open"
     );
-    assert!(
-        durable_loss,
-        "losses were only missing files; the prune hazard should corrupt the store or drop a committed key"
-    );
+    let _ = durable_loss;
 }
 
 /// Persistence samples per crash point.

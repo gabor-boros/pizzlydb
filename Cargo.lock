@@ -535,6 +535,7 @@ dependencies = [
  "criterion",
  "getrandom",
  "pizzlydb-testkit",
+ "rustix",
  "tempfile",
  "thiserror",
 ]

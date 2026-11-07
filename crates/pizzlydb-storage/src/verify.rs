@@ -17,10 +17,8 @@ use crate::vfs::Vfs;
 ///
 /// # Limitations
 ///
-/// - **Offline only.** The path is opened read-write, so recovery can write
-///   the file, and nothing excludes a live writer.
-///   [Read-only open](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/015-exclusive-ownership-and-read-only-open.md)
-///   is later work.
+/// - **Offline only.** The path is opened read-only and takes a shared lock.
+///   A live read-write opener returns [`StorageError::Locked`].
 /// - **Every namespace.** The check is the page file, not one graph namespace.
 ///   Graph agreement is `pizzlydb_graph::verify_full`. Online scrubbing is
 ///   [full verification](https://github.com/gabor-boros/pizzlydb/blob/main/docs/roadmap/107-full-verification-and-online-scrubbing.md).
@@ -47,7 +45,7 @@ use crate::vfs::Vfs;
 /// assert!(verify_quick(&vfs, Path::new("db")).is_ok());
 /// ```
 pub fn verify_quick<V: Vfs>(vfs: &V, path: &Path) -> Result<(), StorageError> {
-    let db = Storage::open(vfs, path, 8, crate::Durability::Full)?;
+    let db = Storage::open_read_only(vfs, path, 8, crate::Durability::Full)?;
     let view = db.snapshot()?;
     let lsn = view.sequence();
     let state = db.page_image(lsn, STATE_PAGE_ID)?;
@@ -69,7 +67,15 @@ pub fn verify_quick<V: Vfs>(vfs: &V, path: &Path) -> Result<(), StorageError> {
             }
             continue;
         }
-        let header = PageHeader::decode(&image).map_err(|_| StorageError::Corrupt)?;
+
+        let header = match PageHeader::decode(&image) {
+            Ok(header) => header,
+            Err(crate::codec::CodecError::ChecksumMismatch) => {
+                return Err(StorageError::ChecksumMismatch { page_id: raw });
+            }
+            Err(_) => return Err(StorageError::Corrupt),
+        };
+
         if header.page_id() != id || header.page_id().as_u64() >= high_water {
             return Err(StorageError::Corrupt);
         }
@@ -145,7 +151,7 @@ mod tests {
         write_page(&vfs, id, &page);
         assert!(matches!(
             verify_quick(&vfs, Path::new("db")),
-            Err(StorageError::Corrupt)
+            Err(StorageError::ChecksumMismatch { page_id }) if page_id == id
         ));
 
         let vfs = committed(800);

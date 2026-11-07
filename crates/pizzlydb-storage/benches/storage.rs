@@ -6,10 +6,10 @@
 //! Syncs here are `MemoryVfs` copies, not a device flush. POSIX fsync counts
 //! are whatever the counting wrapper records when a caller swaps the backend.
 
-use std::cell::Cell;
 use std::hint::black_box;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -83,10 +83,10 @@ fn physical(c: &mut Criterion) {
 }
 
 fn physical_report() -> BenchReport {
-    let counts = Rc::new(Cell::new(0u64));
+    let counts = Arc::new(AtomicU64::new(0));
     let vfs = CountingVfs {
         inner: MemoryVfs::new(),
-        syncs: Rc::clone(&counts),
+        syncs: Arc::clone(&counts),
     };
     let db = Storage::create(&vfs, Path::new("db"), 32, Durability::Full, |id| id.fill(1))
         .expect("create");
@@ -131,7 +131,7 @@ fn physical_report() -> BenchReport {
                 &samples,
                 wal,
                 wal as f64 / mutations,
-                counts.get(),
+                counts.load(Ordering::Relaxed),
                 before.read_io(),
                 0,
                 &before,
@@ -148,7 +148,7 @@ fn physical_report() -> BenchReport {
                 pages_written,
                 wal_bytes: wal,
                 wal_bytes_per_mutation: wal as f64 / mutations,
-                fsyncs: counts.get(),
+                fsyncs: counts.load(Ordering::Relaxed),
                 rss_bytes,
                 rss_is_peak,
                 hit_ratio: ratio(&after),
@@ -164,7 +164,7 @@ fn physical_report() -> BenchReport {
                 pages_written: stats.write_io(),
                 wal_bytes: wal_after_checkpoint,
                 wal_bytes_per_mutation: 0.0,
-                fsyncs: counts.get(),
+                fsyncs: counts.load(Ordering::Relaxed),
                 rss_bytes,
                 rss_is_peak,
                 hit_ratio: ratio(&stats),
@@ -180,7 +180,7 @@ fn physical_report() -> BenchReport {
                 pages_written: db.stats().write_io(),
                 wal_bytes: wal_after_extra,
                 wal_bytes_per_mutation: 0.0,
-                fsyncs: counts.get(),
+                fsyncs: counts.load(Ordering::Relaxed),
                 rss_bytes,
                 rss_is_peak,
                 hit_ratio: ratio(&db.stats()),
@@ -308,12 +308,12 @@ fn rss() -> (u64, bool) {
 
 struct CountingVfs {
     inner: MemoryVfs,
-    syncs: Rc<Cell<u64>>,
+    syncs: Arc<AtomicU64>,
 }
 
 struct CountingFile {
     inner: MemoryFile,
-    syncs: Rc<Cell<u64>>,
+    syncs: Arc<AtomicU64>,
 }
 
 impl Vfs for CountingVfs {
@@ -327,7 +327,7 @@ impl Vfs for CountingVfs {
     ) -> Result<Self::File, VfsError> {
         Ok(CountingFile {
             inner: self.inner.open(path, role, options)?,
-            syncs: Rc::clone(&self.syncs),
+            syncs: Arc::clone(&self.syncs),
         })
     }
 
@@ -355,7 +355,7 @@ impl VfsFile for CountingFile {
 
     fn sync(&mut self) -> Result<(), VfsError> {
         self.inner.sync()?;
-        self.syncs.set(self.syncs.get().saturating_add(1));
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

@@ -19,11 +19,14 @@
 use std::fs::File;
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use rustix::fs::{FlockOperation, flock};
+use rustix::io::Errno;
 
 use crate::vfs::{
-    FileRole, OpenOptions, Vfs, VfsError, VfsFile, io_error, read_only_error, validate_open,
-    validate_path,
+    FileLock, FileRole, LockMode, OpenOptions, Vfs, VfsError, VfsFile, io_error, read_only_error,
+    validate_open, validate_path,
 };
 
 /// Filesystem backend.
@@ -128,6 +131,41 @@ impl Vfs for PosixVfs {
             Err(err) => Err(map_io(err)),
         }
     }
+
+    fn lock(&self, path: &Path, mode: LockMode) -> Result<FileLock, VfsError> {
+        validate_path(path)?;
+
+        let lock_path = lock_path(path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true);
+
+        let file = opts.open(&lock_path).map_err(map_io)?;
+        let operation = match mode {
+            LockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
+            LockMode::Shared => FlockOperation::NonBlockingLockShared,
+        };
+
+        if let Err(err) = flock(&file, operation) {
+            if err == Errno::WOULDBLOCK || err == Errno::AGAIN {
+                return Err(VfsError::Locked);
+            }
+            return Err(map_io(io::Error::from_raw_os_error(err.raw_os_error())));
+        }
+
+        Ok(FileLock::on_drop(move || {
+            let _ = flock(&file, FlockOperation::Unlock);
+            drop(file);
+        }))
+    }
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 /// One filesystem descriptor.
@@ -166,6 +204,20 @@ impl VfsFile for PosixFile {
         retry_io(|| file.sync_all()).map_err(map_io)
     }
 
+    fn sync_data(&mut self) -> Result<(), VfsError> {
+        let file = self.file()?;
+        retry_io(|| file.sync_data()).map_err(map_io)
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<(), VfsError> {
+        if self.read_only {
+            return Err(read_only_error());
+        }
+
+        let file = self.file()?;
+        retry_io(|| file.set_len(len)).map_err(map_io)
+    }
+
     fn len(&self) -> Result<u64, VfsError> {
         let file = self.file()?;
         Ok(retry_io(|| file.metadata()).map_err(map_io)?.len())
@@ -190,12 +242,20 @@ impl Drop for PosixFile {
 }
 
 fn map_io(error: io::Error) -> VfsError {
+    if error.kind() == ErrorKind::StorageFull || is_quota(&error) {
+        return VfsError::NoSpace;
+    }
+
     match error.kind() {
         ErrorKind::NotFound => VfsError::NotFound,
         ErrorKind::AlreadyExists => VfsError::AlreadyExists,
         ErrorKind::InvalidInput => VfsError::InvalidPath,
         _ => VfsError::Io { source: error },
     }
+}
+
+fn is_quota(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(69 | 122))
 }
 
 fn retry_io<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -209,10 +269,12 @@ fn retry_io<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::PosixVfs;
-    use crate::vfs::{FileRole, OpenOptions, Vfs, VfsError, VfsFile};
+    use crate::vfs::{FileRole, LockMode, OpenOptions, Vfs, VfsError, VfsFile};
+    use crate::{Durability, Storage, verify_quick, wal_path};
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -220,6 +282,55 @@ mod tests {
 
     fn assert_io(error: &VfsError) {
         assert!(matches!(error, VfsError::Io { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn exclusive_lock_blocks_a_child_and_releases_when_the_parent_drops_it() {
+        if std::env::var_os("PIZZLYDB_LOCK_CHILD").is_some() {
+            let path = std::env::var("PIZZLYDB_LOCK_PATH").expect("lock path");
+            let locked = PosixVfs::new().lock(Path::new(&path), LockMode::Exclusive);
+            std::process::exit(if locked.is_err() { 2 } else { 0 });
+        }
+
+        let dir = temp_dir();
+        let path = dir.path().join("db");
+        let vfs = PosixVfs::new();
+        let held = vfs.lock(&path, LockMode::Exclusive).unwrap();
+        let blocked = lock_child(&path);
+        assert_eq!(blocked.code(), Some(2));
+        drop(held);
+        let free = lock_child(&path);
+        assert_eq!(free.code(), Some(0));
+    }
+
+    fn lock_child(path: &Path) -> std::process::ExitStatus {
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .env("PIZZLYDB_LOCK_CHILD", "1")
+            .env("PIZZLYDB_LOCK_PATH", path)
+            .args([
+                "--exact",
+                "vfs_posix::tests::exclusive_lock_blocks_a_child_and_releases_when_the_parent_drops_it",
+            ])
+            .status()
+            .expect("spawn lock child")
+    }
+
+    #[test]
+    fn read_only_open_and_verify_succeed_on_mode_0444() {
+        let dir = temp_dir();
+        let vfs = PosixVfs::new();
+        let path = dir.path().join("db");
+        let db = Storage::create(&vfs, &path, 4, Durability::Full, |id| id.fill(4)).unwrap();
+        drop(db);
+        for file in [&path, &wal_path(&path)] {
+            let mut permissions = std::fs::metadata(file).unwrap().permissions();
+            permissions.set_mode(0o444);
+            std::fs::set_permissions(file, permissions).unwrap();
+        }
+        let db = Storage::open_read_only(&vfs, &path, 4, Durability::Full).unwrap();
+        assert!(db.snapshot().unwrap().get(b"k").unwrap().is_none());
+        drop(db);
+        assert!(verify_quick(&vfs, &path).is_ok());
     }
 
     #[test]

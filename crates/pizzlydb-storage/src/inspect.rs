@@ -10,7 +10,7 @@ use crate::codec::{CodecError, get_u64};
 use crate::page::{ALLOCATOR_PAGE_ID, BITMAP_PAGE_ID, HEADER_SIZE, PAGE_SIZE, PageHeader, PageId};
 use crate::space::{Space, SpaceError, SpillImage};
 use crate::superblock::{COPY_A, COPY_B, Superblock};
-use crate::vfs::{FileRole, OpenOptions, Vfs, VfsError, VfsFile};
+use crate::vfs::{FileRole, LockMode, OpenOptions, Vfs, VfsError, VfsFile};
 
 const SPILL_HEAD_OFFSET: usize = PAGE_SIZE - 16;
 const SPILL_NEXT_OFFSET: usize = HEADER_SIZE;
@@ -92,6 +92,9 @@ pub struct InspectReport {
 /// assert!(inspect(&vfs, Path::new("db")).unwrap().damage.is_none());
 /// ```
 pub fn inspect<V: Vfs>(vfs: &V, path: &Path) -> Result<InspectReport, crate::StorageError> {
+    let _lock = vfs
+        .lock(path, LockMode::Shared)
+        .map_err(crate::StorageError::from)?;
     let mut file = vfs.open(path, FileRole::Main, &OpenOptions::new().read_only(true))?;
     let len = file.len().map_err(crate::StorageError::from)?;
     let page_len = u64::try_from(PAGE_SIZE).map_err(|_| crate::StorageError::Corrupt)?;
@@ -186,7 +189,7 @@ pub fn inspect<V: Vfs>(vfs: &V, path: &Path) -> Result<InspectReport, crate::Sto
             ));
         }
     };
-    if Space::load(&header, &bitmap_page, &spills).is_err() {
+    if Space::load(&header, &bitmap_page, &spills, &[]).is_err() {
         return Ok(report(
             logical,
             Some(damage(BITMAP_PAGE_ID, DamageReason::Bitmap)),

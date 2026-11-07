@@ -11,14 +11,13 @@
 //! and invalidates open handles. [`MemoryVfs::remove`] and [`MemoryVfs::replace`]
 //! fail while a handle is open.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::vfs::{
-    FileRole, OpenOptions, Vfs, VfsError, VfsFile, io_error, read_only_error, validate_open,
-    validate_path,
+    FileLock, FileRole, LockMode, OpenOptions, Vfs, VfsError, VfsFile, io_error, read_only_error,
+    validate_open, validate_path,
 };
 
 #[derive(Debug)]
@@ -56,6 +55,8 @@ struct MemoryState {
     pending: Vec<PendingRename>,
     /// Bumped by [`MemoryVfs::crash`]. Handles store the value from `open`.
     generation: u64,
+    /// `(exclusive, shared holders)` keyed by the database path.
+    locks: HashMap<PathBuf, (bool, u32)>,
 }
 
 /// Process-local files used by tests.
@@ -93,7 +94,7 @@ struct MemoryState {
 /// ```
 #[derive(Debug)]
 pub struct MemoryVfs {
-    state: Rc<RefCell<MemoryState>>,
+    state: Arc<Mutex<MemoryState>>,
 }
 
 impl Default for MemoryVfs {
@@ -107,10 +108,11 @@ impl MemoryVfs {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Rc::new(RefCell::new(MemoryState {
+            state: Arc::new(Mutex::new(MemoryState {
                 files: HashMap::new(),
                 pending: Vec::new(),
                 generation: 0,
+                locks: HashMap::new(),
             })),
         }
     }
@@ -150,7 +152,7 @@ impl MemoryVfs {
     /// assert!(matches!(missing, pizzlydb_storage::vfs::VfsError::NotFound));
     /// ```
     pub fn crash(&self) {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         state.generation = state.generation.wrapping_add(1);
         let pending = std::mem::take(&mut state.pending);
         for op in pending.into_iter().rev() {
@@ -246,7 +248,7 @@ impl MemoryVfs {
     pub fn replace(&self, path: &Path, role: FileRole, bytes: &[u8]) -> Result<(), VfsError> {
         let key = file_key(path, role)?;
 
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         let file = state.files.get_mut(&key).ok_or(VfsError::NotFound)?;
         if file.open_count > 0 {
             return Err(io_error("file is open"));
@@ -297,6 +299,45 @@ fn undo_rename(files: &mut HashMap<(PathBuf, FileRole), MemFile>, op: PendingRen
 impl Vfs for MemoryVfs {
     type File = MemoryFile;
 
+    fn lock(&self, path: &Path, mode: LockMode) -> Result<FileLock, VfsError> {
+        validate_path(path)?;
+        let mut state = self.state.lock().expect("memory vfs");
+        let entry = state.locks.entry(path.to_path_buf()).or_insert((false, 0));
+        match mode {
+            LockMode::Exclusive => {
+                if entry.0 || entry.1 > 0 {
+                    return Err(VfsError::Locked);
+                }
+                entry.0 = true;
+            }
+            LockMode::Shared => {
+                if entry.0 {
+                    return Err(VfsError::Locked);
+                }
+                entry.1 = entry.1.saturating_add(1);
+            }
+        }
+        drop(state);
+
+        let state = Arc::clone(&self.state);
+        let owned = path.to_path_buf();
+        let exclusive = matches!(mode, LockMode::Exclusive);
+        Ok(FileLock::on_drop(move || {
+            let mut state = state.lock().expect("memory vfs");
+            let Some(entry) = state.locks.get_mut(&owned) else {
+                return;
+            };
+            if exclusive {
+                entry.0 = false;
+            } else {
+                entry.1 = entry.1.saturating_sub(1);
+            }
+            if !entry.0 && entry.1 == 0 {
+                state.locks.remove(&owned);
+            }
+        }))
+    }
+
     fn open(
         &self,
         path: &Path,
@@ -306,7 +347,7 @@ impl Vfs for MemoryVfs {
         validate_open(path, options)?;
         let key = (path.to_path_buf(), role);
 
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         match state.files.get_mut(&key) {
             Some(file) => {
                 if options.is_exclusive() {
@@ -326,7 +367,7 @@ impl Vfs for MemoryVfs {
         }
 
         Ok(MemoryFile {
-            state: Rc::clone(&self.state),
+            state: Arc::clone(&self.state),
             key,
             generation: state.generation,
             read_only: options.is_read_only(),
@@ -337,7 +378,7 @@ impl Vfs for MemoryVfs {
     fn sync_dir(&self, directory: &Path) -> Result<(), VfsError> {
         validate_path(directory)?;
 
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         for file in state.files.values_mut() {
             file.published = true;
         }
@@ -353,7 +394,7 @@ impl Vfs for MemoryVfs {
             return Err(VfsError::InvalidPath);
         }
 
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         if let Some(op) = state.pending.last()
             && op.from == to_key
             && op.to == from_key
@@ -393,7 +434,7 @@ impl Vfs for MemoryVfs {
 
     fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError> {
         let key = file_key(path, role)?;
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         let open_count = state.files.get(&key).ok_or(VfsError::NotFound)?.open_count;
         if open_count > 0 {
             return Err(io_error("file is open"));
@@ -410,7 +451,7 @@ impl Vfs for MemoryVfs {
 /// syncs, then releases, and returns the sync error if there is one.
 #[derive(Debug)]
 pub struct MemoryFile {
-    state: Rc<RefCell<MemoryState>>,
+    state: Arc<Mutex<MemoryState>>,
     key: (PathBuf, FileRole),
     generation: u64,
     read_only: bool,
@@ -426,7 +467,7 @@ impl MemoryFile {
             return Err(io_error("file is closed"));
         }
 
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("memory vfs");
         if state.generation != self.generation {
             return Err(io_error("file handle is stale"));
         }
@@ -448,7 +489,7 @@ impl MemoryFile {
 
         // A borrow still held during unwind means this handle cannot update the
         // count. The handle is already marked closed, so Drop will not retry.
-        let Ok(mut state) = self.state.try_borrow_mut() else {
+        let Ok(mut state) = self.state.try_lock() else {
             return;
         };
 
@@ -522,6 +563,17 @@ impl VfsFile for MemoryFile {
     fn len(&self) -> Result<u64, VfsError> {
         self.with_open_file(|file| {
             u64::try_from(file.visible.len()).map_err(|_| io_error("length overflow"))
+        })
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<(), VfsError> {
+        if self.read_only {
+            return Err(read_only_error());
+        }
+        self.with_open_file(|file| {
+            let new_len = usize::try_from(len).map_err(|_| io_error("length overflow"))?;
+            file.visible.resize(new_len, 0);
+            Ok(())
         })
     }
 

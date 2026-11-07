@@ -23,8 +23,10 @@ An architecture decision record (ADR) freezes one architectural choice. Guide [Â
 | [ADR-008](0008-durable-subscriptions.md) | Subscription protocol, acknowledgement, replay, expiry | Reserved | [068](../roadmap/068-durable-subscriptions-core.md) |
 | [ADR-009](0009-authorization-and-tenant-isolation.md) | Authorization, tenant isolation, token binding | Reserved | [207](../roadmap/207-authorization-rbac-and-policy-epochs.md) |
 | [ADR-010](0010-retention-and-recovery-compatibility.md) | Retention, backup and restore, checkpoint compatibility | Reserved | [114](../roadmap/114-retention-management-and-inspection.md) |
+| [ADR-011](0011-storage-concurrency.md) | Storage lock order, `Send + Sync`, durability modes | Accepted | [016](../roadmap/016-thread-safe-storage-engine.md) |
+| [ADR-012](0012-storage-format-policy.md) | Superblock minor, feature flags, and WAL generation | Accepted | [024](../roadmap/024-storage-format-versioning-and-golden-fixtures.md) |
 
-Other roadmap issues also produce ADRs: a storage concurrency ADR ([016](../roadmap/016-thread-safe-storage-engine.md)), a storage format policy ADR ([024](../roadmap/024-storage-format-versioning-and-golden-fixtures.md)), and an amendment to ADR-001 for a new composition crate ([071](../roadmap/071-embedded-engine-composition.md)). New ADRs take the next free number, starting at ADR-011.
+Other roadmap issues also produce ADRs: an amendment to ADR-001 for a new composition crate ([071](../roadmap/071-embedded-engine-composition.md)). New ADRs take the next free number, starting at ADR-013.
 
 ## Writing an ADR
 

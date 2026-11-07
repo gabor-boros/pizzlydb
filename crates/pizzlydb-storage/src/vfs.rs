@@ -17,10 +17,9 @@
 //! writes to any backend. The same script and the same calls fail at the same
 //! numbered operation.
 
-use std::cell::RefCell;
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
@@ -46,6 +45,12 @@ pub enum VfsError {
     /// `read_exact` reached the end of the file before the buffer was full.
     #[error("truncated input")]
     Truncated,
+    /// Another opener holds a conflicting advisory lock.
+    #[error("database file is locked")]
+    Locked,
+    /// The filesystem returned `ENOSPC` or `EDQUOT`.
+    #[error("no space left on the device")]
+    NoSpace,
     /// The transfer failed. `source` is retained for logs.
     #[error("I/O failure")]
     Io {
@@ -72,6 +77,54 @@ pub(crate) fn read_only_error() -> VfsError {
 
 fn injected_fault() -> VfsError {
     io_error("injected fault")
+}
+
+/// How [`Vfs::lock`] should exclude other openers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    /// Several readers. Refused while an [`Self::Exclusive`] lock is held.
+    Shared,
+    /// One writer. Refused while any lock is held.
+    Exclusive,
+}
+
+/// Advisory lock released on drop.
+///
+/// The memory backend releases its in-process record. The POSIX backend closes
+/// the descriptor, which releases `flock`. Process exit releases both.
+pub struct FileLock {
+    release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl FileLock {
+    pub(crate) fn noop() -> Self {
+        Self {
+            release: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn on_drop(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Mutex::new(Some(Box::new(release))),
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let Ok(slot) = self.release.get_mut() else {
+            return;
+        };
+        if let Some(release) = slot.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for FileLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FileLock")
+    }
 }
 
 /// Reject an empty path or a path that contains a NUL byte.
@@ -244,9 +297,13 @@ impl OpenOptions {
 ///
 /// file.sync().unwrap();
 /// ```
-pub trait Vfs {
+pub trait Vfs: Send + Sync {
     /// Open file owned by this backend.
-    type File: VfsFile;
+    ///
+    /// The handle is [`Send`] so a database can move to another thread. The
+    /// backend itself is [`Sync`]: callers share one store and each call locks
+    /// only the state that call uses.
+    type File: VfsFile + Send;
 
     /// Open `path` for `role`.
     ///
@@ -349,6 +406,20 @@ pub trait Vfs {
     /// assert!(matches!(missing, VfsError::NotFound));
     /// ```
     fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError>;
+
+    /// Take an advisory lock on `path` for the returned guard's lifetime.
+    ///
+    /// The default accepts every request. Backends that share a process or a
+    /// filesystem override it. A conflicting lock is [`VfsError::Locked`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::Locked`] when the mode conflicts with a held lock,
+    /// and [`VfsError::Io`] when the lock file cannot be created.
+    fn lock(&self, path: &Path, mode: LockMode) -> Result<FileLock, VfsError> {
+        let _ = (path, mode);
+        Ok(FileLock::noop())
+    }
 }
 
 /// One open file.
@@ -401,6 +472,52 @@ pub trait VfsFile {
     ///
     /// Returns [`VfsError::Io`] when the length cannot be read.
     fn len(&self) -> Result<u64, VfsError>;
+
+    /// Set the logical length.
+    ///
+    /// A longer file is padded with zeros. The default reports that the backend
+    /// cannot change the length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::Io`] when the length cannot be changed, and
+    /// [`VfsError::NoSpace`] when the filesystem cannot store it.
+    fn set_len(&mut self, len: u64) -> Result<(), VfsError> {
+        let _ = len;
+        Err(io_error("set_len is not supported"))
+    }
+
+    /// Best-effort reservation of `len` bytes at `offset`.
+    ///
+    /// The fallback extends the file with [`Self::set_len`] when `offset + len`
+    /// is past the current length. That does not allocate blocks on a filesystem
+    /// that creates a hole. `posix_fallocate` is not used.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error from [`Self::set_len`] or [`Self::len`].
+    fn preallocate(&mut self, offset: u64, len: u64) -> Result<(), VfsError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io_error("offset overflow"))?;
+
+        if end > self.len()? {
+            self.set_len(end)?;
+        }
+
+        Ok(())
+    }
+
+    /// Make file data durable without requiring metadata.
+    ///
+    /// The default is [`Self::sync`]. The POSIX backend calls `sync_data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::Io`] when the barrier fails.
+    fn sync_data(&mut self) -> Result<(), VfsError> {
+        self.sync()
+    }
 
     /// Whether [`Self::len`] is zero.
     ///
@@ -652,8 +769,8 @@ struct FaultState {
     faults: Vec<Fault>,
 }
 
-fn take_fault(state: &Rc<RefCell<FaultState>>) -> Result<Option<FaultKind>, VfsError> {
-    let mut state = state.borrow_mut();
+fn take_fault(state: &Arc<Mutex<FaultState>>) -> Result<Option<FaultKind>, VfsError> {
+    let mut state = state.lock().expect("fault vfs");
     state.seen = state
         .seen
         .checked_add(1)
@@ -715,7 +832,7 @@ fn take_fault(state: &Rc<RefCell<FaultState>>) -> Result<Option<FaultKind>, VfsE
 #[derive(Debug)]
 pub struct FaultInjecting<V> {
     inner: V,
-    state: Rc<RefCell<FaultState>>,
+    state: Arc<Mutex<FaultState>>,
 }
 
 impl<V> FaultInjecting<V> {
@@ -725,7 +842,7 @@ impl<V> FaultInjecting<V> {
     pub fn new(inner: V, faults: impl IntoIterator<Item = Fault>) -> Self {
         Self {
             inner,
-            state: Rc::new(RefCell::new(FaultState {
+            state: Arc::new(Mutex::new(FaultState {
                 seen: 0,
                 faults: faults.into_iter().collect(),
             })),
@@ -760,7 +877,7 @@ impl<V: Vfs> Vfs for FaultInjecting<V> {
 
         Ok(FaultFile {
             inner: Some(self.inner.open(path, role, options)?),
-            state: Rc::clone(&self.state),
+            state: Arc::clone(&self.state),
             role,
         })
     }
@@ -794,7 +911,7 @@ impl<V: Vfs> Vfs for FaultInjecting<V> {
 #[derive(Debug)]
 pub struct FaultFile<F> {
     inner: Option<F>,
-    state: Rc<RefCell<FaultState>>,
+    state: Arc<Mutex<FaultState>>,
     role: FileRole,
 }
 
@@ -853,6 +970,22 @@ impl<F: VfsFile> VfsFile for FaultFile<F> {
             .as_ref()
             .ok_or_else(|| io_error("file is closed"))?
             .len()
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<(), VfsError> {
+        if take_fault(&self.state)?.is_some() {
+            return Err(injected_fault());
+        }
+
+        self.inner_mut()?.set_len(len)
+    }
+
+    fn sync_data(&mut self) -> Result<(), VfsError> {
+        if take_fault(&self.state)?.is_some() {
+            return Err(injected_fault());
+        }
+
+        self.inner_mut()?.sync_data()
     }
 
     fn close(mut self) -> Result<(), VfsError> {

@@ -12,7 +12,9 @@
 //!
 //! A new file covers [`INITIAL_PAGES`] ids. When no clear bit remains below
 //! the high-water mark, the mark advances by [`EXTENT_PAGES`]. It does not
-//! advance when another extent would pass [`MAX_BITMAP_PAGES`].
+//! advance when another extent would pass [`MAX_ADDRESSABLE_PAGES`]. Each
+//! bitmap page holds [`MAX_BITMAP_PAGES`] ids. Further pages are a chain. The
+//! last 8 bytes of a bitmap page are the next page id, or zero.
 //!
 //! [`Space::retire`] records a page id and an LSN. The bit stays set.
 //! [`Space::reclaim`] clears that bit only when the retire LSN is strictly
@@ -77,10 +79,15 @@ pub const EXTENT_PAGES: u64 = 64;
 pub const MAX_RETIRE: usize = 64;
 
 const BITMAP_BYTES: usize = PAGE_SIZE - HEADER_SIZE;
-const BITMAP_BITS: usize = BITMAP_BYTES * 8;
+const BITMAP_LINK_LEN: usize = 8;
+const BITMAP_PAYLOAD: usize = BITMAP_BYTES - BITMAP_LINK_LEN;
+const BITMAP_BITS: usize = BITMAP_PAYLOAD * 8;
 
-/// Page ids addressable by the bitmap page.
-pub const MAX_BITMAP_PAGES: u64 = 65_312;
+/// Page ids stored in one bitmap page.
+pub const MAX_BITMAP_PAGES: u64 = 65_248;
+
+/// Page ids the allocator will track across bitmap pages.
+pub const MAX_ADDRESSABLE_PAGES: u64 = 1 << 32;
 
 const HIGH_WATER_OFFSET: usize = HEADER_SIZE;
 const BITMAP_ID_OFFSET: usize = HIGH_WATER_OFFSET + 8;
@@ -107,7 +114,9 @@ const SPILL_CAPACITY: usize = (PAGE_SIZE - SPILL_LIST_OFFSET) / SPILL_ENTRY_LEN;
 
 const MAX_FREE_CLASS: u8 = 13;
 
-const _: () = assert!(BITMAP_BITS == 65_312);
+const _: () = assert!(BITMAP_BITS == 65_248);
+const _: () = assert!(BITMAP_PAYLOAD + BITMAP_LINK_LEN == BITMAP_BYTES);
+const _: () = assert!(MAX_BITMAP_PAGES as usize == BITMAP_BITS);
 const _: () = assert!(PAGE_SIZE.ilog2() == 13);
 const _: () = assert!(INITIAL_PAGES >= FIRST_DATA_PAGE_ID.as_u64());
 const _: () = assert!(INITIAL_PAGES.is_multiple_of(EXTENT_PAGES));
@@ -132,7 +141,7 @@ const _: () = assert!(SPILL_HEAD_OFFSET + 8 == PAGE_SIZE - 8);
 /// let mut encoded = Space::create().encode();
 /// encoded.header[HEADER_SIZE] ^= 0xff;
 ///
-/// let err = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills).unwrap_err();
+/// let err = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills, &encoded.extra_bitmaps).unwrap_err();
 /// assert_eq!(err, SpaceError::Corrupt);
 /// ```
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -164,7 +173,7 @@ pub enum SpaceError {
 /// space.retire(page, Lsn::new(4)).unwrap();
 ///
 /// let encoded = space.encode();
-/// let loaded = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills).unwrap();
+/// let loaded = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills, &encoded.extra_bitmaps).unwrap();
 ///
 /// assert!(loaded.is_allocated(page));
 /// assert!(loaded.is_retired(page));
@@ -173,8 +182,10 @@ pub enum SpaceError {
 pub struct EncodedSpace {
     /// Sealed allocator header page.
     pub header: [u8; PAGE_SIZE],
-    /// Sealed bitmap page.
+    /// Sealed first bitmap page.
     pub bitmap: [u8; PAGE_SIZE],
+    /// Later bitmap pages, in chain order.
+    pub extra_bitmaps: Vec<SpillImage>,
     /// Spill pages in chain order, head first.
     pub spills: Vec<SpillImage>,
 }
@@ -243,6 +254,8 @@ struct SpillPage {
 pub struct Space {
     high_water: u64,
     bitmap: Vec<u8>,
+    extra_bitmap_pages: Vec<PageId>,
+    page_limit: u64,
     retires: Vec<RetireEntry>,
     spills: Vec<SpillPage>,
     hints: Vec<Hint>,
@@ -270,7 +283,9 @@ impl Space {
     pub fn create() -> Self {
         let mut space = Self {
             high_water: INITIAL_PAGES,
-            bitmap: vec![0; BITMAP_BYTES],
+            bitmap: vec![0; BITMAP_PAYLOAD],
+            extra_bitmap_pages: Vec::new(),
+            page_limit: MAX_ADDRESSABLE_PAGES,
             retires: Vec::new(),
             spills: Vec::new(),
             hints: Vec::new(),
@@ -607,7 +622,7 @@ impl Space {
     /// let mut space = Space::create();
     /// let page = space.allocate(PageKind::BTreeLeaf).unwrap();
     /// let encoded = space.encode();
-    /// let loaded = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills).unwrap();
+    /// let loaded = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills, &encoded.extra_bitmaps).unwrap();
     ///
     /// assert_eq!(loaded.allocate(PageKind::BTreeLeaf).unwrap(), PageId::new(5));
     /// assert!(loaded.is_allocated(page));
@@ -615,9 +630,13 @@ impl Space {
     #[must_use]
     pub fn encode(&self) -> EncodedSpace {
         assert_eq!(
-            self.bitmap.len(),
-            BITMAP_BYTES,
-            "bitmap covers one page body"
+            self.bitmap.len() % BITMAP_PAYLOAD,
+            0,
+            "bitmap chunks are payload sized"
+        );
+        assert_eq!(
+            self.extra_bitmap_pages.len() + 1,
+            self.bitmap.len() / BITMAP_PAYLOAD
         );
 
         assert!(
@@ -627,7 +646,8 @@ impl Space {
 
         EncodedSpace {
             header: self.encode_header(),
-            bitmap: self.encode_bitmap(),
+            bitmap: self.encode_bitmap_page(0, BITMAP_PAGE_ID),
+            extra_bitmaps: self.encode_extra_bitmaps(),
             spills: self.encode_spills(),
         }
     }
@@ -653,17 +673,41 @@ impl Space {
     /// let mut space = Space::create();
     /// let page = space.allocate(PageKind::BTreeLeaf).unwrap();
     /// let encoded = space.encode();
-    /// let mut loaded = Space::load(&encoded.header, &encoded.bitmap, &[]).unwrap();
+    /// let mut loaded = Space::load(&encoded.header, &encoded.bitmap, &[], &[]).unwrap();
     ///
     /// assert_ne!(loaded.allocate(PageKind::BTreeLeaf).unwrap(), page);
     /// ```
-    pub fn load(header: &[u8], bitmap: &[u8], spills: &[SpillImage]) -> Result<Self, SpaceError> {
+    pub fn load(
+        header: &[u8],
+        bitmap: &[u8],
+        spills: &[SpillImage],
+        extra_bitmaps: &[SpillImage],
+    ) -> Result<Self, SpaceError> {
         let decoded = decode_header(header)?;
-        let bits = decode_bitmap(bitmap)?;
+        let (mut bits, mut next) = decode_bitmap_page(bitmap, BITMAP_PAGE_ID)?;
+        let mut extra_pages = Vec::new();
+        let mut hops = 0usize;
+        while next != 0 {
+            hops = hops.saturating_add(1);
+            if hops > 65_536 {
+                return Err(SpaceError::Corrupt);
+            }
+            let page_id = PageId::new(next);
+            let image = extra_bitmaps
+                .iter()
+                .find(|image| image.page_id == page_id)
+                .ok_or(SpaceError::Corrupt)?;
+            let (payload, link) = decode_bitmap_page(&image.bytes, page_id)?;
+            bits.extend_from_slice(&payload);
+            extra_pages.push(page_id);
+            next = link;
+        }
         let spill_pages = decode_spill_chain(decoded.spill_head, spills, decoded.high_water)?;
         let space = Self {
             high_water: decoded.high_water,
             bitmap: bits,
+            extra_bitmap_pages: extra_pages,
+            page_limit: MAX_ADDRESSABLE_PAGES,
             retires: decoded.retires,
             spills: spill_pages,
             hints: decoded.hints,
@@ -684,9 +728,10 @@ impl Space {
             .high_water
             .checked_add(EXTENT_PAGES)
             .ok_or(SpaceError::Full)?;
-        if next > MAX_BITMAP_PAGES {
+        if next > self.page_limit {
             return Err(SpaceError::Full);
         }
+        self.ensure_cover(next - 1)?;
 
         let grown = self.high_water;
         if self.first_clear(grown, next)? != Some(grown) {
@@ -827,9 +872,10 @@ impl Space {
             .checked_add(EXTENT_PAGES)
             .ok_or(SpaceError::Full)?;
 
-        if next > MAX_BITMAP_PAGES {
+        if next > self.page_limit {
             return Err(SpaceError::Full);
         }
+        self.ensure_cover(next - 1)?;
 
         self.high_water = next;
         Ok(())
@@ -859,14 +905,38 @@ impl Space {
         Ok(None)
     }
 
+    fn ensure_cover(&mut self, id: u64) -> Result<(), SpaceError> {
+        if id >= self.page_limit {
+            return Err(SpaceError::Corrupt);
+        }
+        let id_us = usize::try_from(id).map_err(|_| SpaceError::Corrupt)?;
+        let chunks_needed = id_us / BITMAP_BITS + 1;
+        while self.bitmap.len() / BITMAP_PAYLOAD < chunks_needed {
+            self.bitmap.resize(self.bitmap.len() + BITMAP_PAYLOAD, 0);
+            let chunk = self.bitmap.len() / BITMAP_PAYLOAD - 1;
+            if chunk == 0 {
+                continue;
+            }
+            let page = (chunk as u64).saturating_mul(BITMAP_BITS as u64);
+            self.extra_bitmap_pages.push(PageId::new(page));
+            let byte = usize::try_from(page / 8).map_err(|_| SpaceError::Corrupt)?;
+            let slot = self.bitmap.get_mut(byte).ok_or(SpaceError::Corrupt)?;
+            *slot |= 1;
+        }
+        Ok(())
+    }
+
     fn bit(&self, id: u64) -> Result<bool, SpaceError> {
-        let (byte, bit) = bit_index(id)?;
-        let slot = self.bitmap.get(byte).copied().ok_or(SpaceError::Corrupt)?;
+        let (byte, bit) = bit_index(id, self.page_limit)?;
+        let Some(slot) = self.bitmap.get(byte).copied() else {
+            return Ok(false);
+        };
         Ok((slot & (1u8 << bit)) != 0)
     }
 
     fn write_bit(&mut self, id: u64, allocated: bool) -> Result<(), SpaceError> {
-        let (byte, bit) = bit_index(id)?;
+        self.ensure_cover(id)?;
+        let (byte, bit) = bit_index(id, self.page_limit)?;
         let slot = self.bitmap.get_mut(byte).ok_or(SpaceError::Corrupt)?;
         let mask = 1u8 << bit;
 
@@ -911,11 +981,30 @@ impl Space {
         page
     }
 
-    fn encode_bitmap(&self) -> [u8; PAGE_SIZE] {
+    fn encode_bitmap_page(&self, chunk: usize, page_id: PageId) -> [u8; PAGE_SIZE] {
         let mut page = [0u8; PAGE_SIZE];
-        page[HEADER_SIZE..].copy_from_slice(&self.bitmap);
-        seal_page(&mut page, PageKind::Bitmap, BITMAP_PAGE_ID);
+        let start = chunk * BITMAP_PAYLOAD;
+        let end = start + BITMAP_PAYLOAD;
+        page[HEADER_SIZE..HEADER_SIZE + BITMAP_PAYLOAD].copy_from_slice(&self.bitmap[start..end]);
+        let next = if chunk + 1 < self.bitmap.len() / BITMAP_PAYLOAD {
+            self.extra_bitmap_pages[chunk].as_u64()
+        } else {
+            0
+        };
+        write_u64(&mut page, PAGE_SIZE - BITMAP_LINK_LEN, next);
+        seal_page(&mut page, PageKind::Bitmap, page_id);
         page
+    }
+
+    fn encode_extra_bitmaps(&self) -> Vec<SpillImage> {
+        self.extra_bitmap_pages
+            .iter()
+            .enumerate()
+            .map(|(index, page_id)| SpillImage {
+                page_id: *page_id,
+                bytes: self.encode_bitmap_page(index + 1, *page_id),
+            })
+            .collect()
     }
 
     fn encode_spills(&self) -> Vec<SpillImage> {
@@ -929,7 +1018,14 @@ impl Space {
     }
 
     fn validate_state(&self) -> Result<(), SpaceError> {
-        if !valid_high_water(self.high_water) || self.bitmap.len() != BITMAP_BYTES {
+        let chunks = self.bitmap.len() / BITMAP_PAYLOAD;
+        let covered = (chunks as u64).saturating_mul(BITMAP_BITS as u64);
+        if !valid_high_water(self.high_water, self.page_limit)
+            || !self.bitmap.len().is_multiple_of(BITMAP_PAYLOAD)
+            || chunks == 0
+            || self.extra_bitmap_pages.len() + 1 != chunks
+            || self.high_water > covered
+        {
             return Err(SpaceError::Corrupt);
         }
 
@@ -1002,7 +1098,8 @@ pub(crate) fn decode_header(page: &[u8]) -> Result<DecodedHeader, SpaceError> {
     }
 
     let high_water = read_u64(page, HIGH_WATER_OFFSET)?;
-    if !valid_high_water(high_water) || read_u64(page, BITMAP_ID_OFFSET)? != BITMAP_PAGE_ID.as_u64()
+    if !valid_high_water(high_water, MAX_ADDRESSABLE_PAGES)
+        || read_u64(page, BITMAP_ID_OFFSET)? != BITMAP_PAGE_ID.as_u64()
     {
         return Err(SpaceError::Corrupt);
     }
@@ -1056,12 +1153,22 @@ pub(crate) fn decode_header(page: &[u8]) -> Result<DecodedHeader, SpaceError> {
     })
 }
 
+#[cfg_attr(not(feature = "fuzzing"), allow(dead_code))]
 pub(crate) fn decode_bitmap(page: &[u8]) -> Result<Vec<u8>, SpaceError> {
+    let (bits, _next) = decode_bitmap_page(page, BITMAP_PAGE_ID)?;
+    Ok(bits)
+}
+
+fn decode_bitmap_page(page: &[u8], page_id: PageId) -> Result<(Vec<u8>, u64), SpaceError> {
     let header = PageHeader::decode(page).map_err(|_| SpaceError::Corrupt)?;
-    if header.kind() != PageKind::Bitmap || header.page_id() != BITMAP_PAGE_ID {
+    if header.kind() != PageKind::Bitmap || header.page_id() != page_id {
         return Err(SpaceError::Corrupt);
     }
-    Ok(page[HEADER_SIZE..].to_vec())
+    let next = read_u64(page, PAGE_SIZE - BITMAP_LINK_LEN)?;
+    Ok((
+        page[HEADER_SIZE..PAGE_SIZE - BITMAP_LINK_LEN].to_vec(),
+        next,
+    ))
 }
 
 struct ParsedSpill {
@@ -1222,8 +1329,8 @@ fn relink(spills: &mut [SpillPage]) {
     spills[last].next = None;
 }
 
-fn valid_high_water(high_water: u64) -> bool {
-    (INITIAL_PAGES..=MAX_BITMAP_PAGES).contains(&high_water)
+fn valid_high_water(high_water: u64, limit: u64) -> bool {
+    (INITIAL_PAGES..=limit).contains(&high_water)
         && (high_water - INITIAL_PAGES).is_multiple_of(EXTENT_PAGES)
 }
 
@@ -1258,8 +1365,8 @@ fn tail_is_clear(bitmap: &[u8], start: u64) -> Result<bool, SpaceError> {
     Ok(bitmap[byte_index..].iter().all(|byte| *byte == 0))
 }
 
-fn bit_index(id: u64) -> Result<(usize, u8), SpaceError> {
-    if id >= MAX_BITMAP_PAGES {
+fn bit_index(id: u64, limit: u64) -> Result<(usize, u8), SpaceError> {
+    if id >= limit || id >= MAX_ADDRESSABLE_PAGES {
         return Err(SpaceError::Corrupt);
     }
 
@@ -1352,6 +1459,7 @@ mod tests {
     }
 
     fn grow_to_limit(space: &mut Space) {
+        space.page_limit = MAX_BITMAP_PAGES;
         let start = space.high_water();
         while space.grow().is_ok() {}
         assert!(space.high_water() > start);
@@ -1488,8 +1596,13 @@ mod tests {
         let page = space.allocate(leaf()).expect("allocate");
         space.record_free_space(page, 100).expect("hint");
         let hinted = space.encode();
-        let loaded =
-            Space::load(&hinted.header, &hinted.bitmap, &hinted.spills).expect("load hint");
+        let loaded = Space::load(
+            &hinted.header,
+            &hinted.bitmap,
+            &hinted.spills,
+            &hinted.extra_bitmaps,
+        )
+        .expect("load hint");
         assert_eq!(loaded.page_with_space(50, |_| 100), Some(page));
         assert_eq!(space.page_with_space(50, |_| 0), None);
         assert_eq!(space.encode().bitmap, hinted.bitmap);
@@ -1561,8 +1674,13 @@ mod tests {
             Err(SpaceError::Corrupt)
         );
         let encoded = space.encode();
-        let loaded = Space::load(&encoded.header, &encoded.bitmap, &encoded.spills)
-            .expect("stale hint still loads");
+        let loaded = Space::load(
+            &encoded.header,
+            &encoded.bitmap,
+            &encoded.spills,
+            &encoded.extra_bitmaps,
+        )
+        .expect("stale hint still loads");
         assert_eq!(loaded, space);
         assert_ne!(loaded.page_with_space(50, |_| 100), Some(hinted));
     }
@@ -1590,8 +1708,13 @@ mod tests {
         let encoded = space.encode();
         assert_eq!(encoded.spills.len(), 1);
         assert_eq!(encoded.spills[0].page_id, head);
-        let mut loaded =
-            Space::load(&encoded.header, &encoded.bitmap, &encoded.spills).expect("load spill");
+        let mut loaded = Space::load(
+            &encoded.header,
+            &encoded.bitmap,
+            &encoded.spills,
+            &encoded.extra_bitmaps,
+        )
+        .expect("load spill");
         assert_eq!(loaded, space);
 
         loaded.reclaim(Lsn::new(2)).expect("reclaim header only");
@@ -1632,8 +1755,13 @@ mod tests {
             0
         );
         let reversed = vec![encoded.spills[1].clone(), encoded.spills[0].clone()];
-        let loaded =
-            Space::load(&encoded.header, &encoded.bitmap, &reversed).expect("load reversed");
+        let loaded = Space::load(
+            &encoded.header,
+            &encoded.bitmap,
+            &reversed,
+            &encoded.extra_bitmaps,
+        )
+        .expect("load reversed");
         assert_eq!(loaded, space);
     }
 
@@ -1664,14 +1792,24 @@ mod tests {
         cleared.bitmap[HEADER_SIZE] &= !1;
         seal(&mut cleared.bitmap).expect("reseal bitmap");
         assert_eq!(
-            Space::load(&cleared.header, &cleared.bitmap, &cleared.spills),
+            Space::load(
+                &cleared.header,
+                &cleared.bitmap,
+                &cleared.spills,
+                &cleared.extra_bitmaps,
+            ),
             Err(SpaceError::Corrupt)
         );
 
         let mut checksum = Space::create().encode();
         checksum.header[HEADER_SIZE] ^= 0xff;
         assert_eq!(
-            Space::load(&checksum.header, &checksum.bitmap, &checksum.spills),
+            Space::load(
+                &checksum.header,
+                &checksum.bitmap,
+                &checksum.spills,
+                &checksum.extra_bitmaps,
+            ),
             Err(SpaceError::Corrupt)
         );
 
@@ -1689,9 +1827,55 @@ mod tests {
         .expect("patch retire id");
         seal(&mut duplicate.header).expect("reseal header");
         assert_eq!(
-            Space::load(&duplicate.header, &duplicate.bitmap, &duplicate.spills),
+            Space::load(
+                &duplicate.header,
+                &duplicate.bitmap,
+                &duplicate.spills,
+                &duplicate.extra_bitmaps,
+            ),
             Err(SpaceError::Corrupt)
         );
+    }
+
+    #[test]
+    fn a_second_bitmap_page_round_trips_and_two_gibibytes_fit() {
+        let mut space = Space::create();
+        space.page_limit = MAX_BITMAP_PAGES + EXTENT_PAGES;
+        while space.high_water() <= MAX_BITMAP_PAGES {
+            space.grow().expect("cross the first bitmap page");
+        }
+        let encoded = space.encode();
+        assert_eq!(encoded.extra_bitmaps.len(), 1);
+        let loaded = Space::load(
+            &encoded.header,
+            &encoded.bitmap,
+            &encoded.spills,
+            &encoded.extra_bitmaps,
+        )
+        .expect("load second bitmap");
+        assert_eq!(loaded.high_water(), space.high_water());
+        assert!(loaded.is_allocated(encoded.extra_bitmaps[0].page_id));
+
+        let mut wide = Space::create();
+        let two_gibibytes = 2u64 * 1024 * 1024 * 1024;
+        let pages = two_gibibytes / u64::try_from(PAGE_SIZE).unwrap();
+        while wide.high_water() < pages {
+            wide.grow().expect("address two gibibytes");
+        }
+        assert!(
+            wide.high_water()
+                .saturating_mul(u64::try_from(PAGE_SIZE).unwrap())
+                >= two_gibibytes
+        );
+        let encoded = wide.encode();
+        let loaded = Space::load(
+            &encoded.header,
+            &encoded.bitmap,
+            &encoded.spills,
+            &encoded.extra_bitmaps,
+        )
+        .expect("load two gibibyte map");
+        assert_eq!(loaded.high_water(), wide.high_water());
     }
 
     #[test]
@@ -1717,8 +1901,13 @@ mod tests {
         let mut space = Space::create();
         let page = space.allocate(leaf()).expect("allocate");
         let encoded = space.encode();
-        let mut loaded =
-            Space::load(&encoded.header, &encoded.bitmap, &encoded.spills).expect("load");
+        let mut loaded = Space::load(
+            &encoded.header,
+            &encoded.bitmap,
+            &encoded.spills,
+            &encoded.extra_bitmaps,
+        )
+        .expect("load");
         assert!(loaded.is_allocated(page));
         assert_ne!(loaded.allocate(leaf()).expect("next"), page);
     }

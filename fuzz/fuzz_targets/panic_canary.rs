@@ -6,7 +6,5 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if data.first().copied() == Some(0xA5) {
-        panic!("injected decoder panic");
-    }
+    assert!(data.first().copied() != Some(0xA5), "injected decoder panic");
 });

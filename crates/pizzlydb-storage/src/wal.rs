@@ -18,9 +18,12 @@
 //! - `8..12`: page size as `u32`, [`PAGE_SIZE`](crate::page::PAGE_SIZE)
 //! - `12..28`: file id, [`FILE_ID_LEN`] bytes
 //! - `28..32`: CRC-32C of the header, with this field treated as zeros
-//! - `32..64`: reserved zeros
+//! - `32..40`: log generation as `u64`, starting at 1
+//! - `40..64`: reserved zeros
 //!
 //! Multi-byte integers are little-endian. The checksum is [`Checksum`].
+//! A reset writes a new header with the next generation and syncs that header.
+//! It does not move or zero frames that belong to the previous generation.
 //!
 //! ## Frame
 //!
@@ -29,7 +32,8 @@
 //! - `0`: kind, `1` for a page image and `2` for a commit
 //! - `1..4`: reserved zeros
 //! - `4..8`: payload length as `u32`
-//! - `8..12`: CRC-32C of the header and the payload, with this field treated as zeros
+//! - `8..12`: CRC-32C of the log generation, the header, and the payload, with
+//!   this field treated as zeros
 //!
 //! A payload longer than [`MAX_PAYLOAD`], or a length that runs past the buffer,
 //! ends the scan. The page bytes are copied only after the frame checksum matches.
@@ -52,8 +56,25 @@
 //! does not sync. A crash can drop that commit. A later [`Wal::sync`] makes the
 //! bytes written so far durable, including a commit recorded as `None`.
 //!
+//! ## Index
+//!
+//! Committed page images stay in the file. The in-memory index is one record
+//! per version: page id, LSN, transaction id, and the file offset of the
+//! sealed page. Lookup of the newest version at or below a snapshot is a
+//! binary search of that page's versions. [`Wal::index_bytes`] is
+//! `versions * `[`INDEX_RECORD_BYTES`] plus the per-page index vectors.
+//! Writers fail with [`WalError::Full`] when another version would pass
+//! [`Wal::version_limit`], so the process does not grow the index without a
+//! bound. [`Wal::open`] reads one frame at a time. Intended locking, once the
+//! engine is shared across threads: the index is behind a reader-writer lock,
+//! and the file handle is locked only for the duration of one frame read or
+//! append.
+//!
 //! [`Wal`] does not synchronize itself. Dropping a [`Wal`] drops the file handle
 //! and does not sync. [`WalError`] is the log's own error.
+
+use std::collections::HashMap;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -66,7 +87,7 @@ use crate::vfs::{VfsError, VfsFile};
 pub const MAGIC: [u8; 4] = *b"PZLW";
 
 /// WAL header version written and accepted by this crate.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Length of the WAL header.
 pub const HEADER_SIZE: usize = 64;
@@ -87,6 +108,8 @@ const PAGE_SIZE_OFFSET: usize = 8;
 const FILE_ID_OFFSET: usize = 12;
 const HEADER_CHECKSUM: usize = 28;
 const HEADER_TAIL: usize = 32;
+const GENERATION_OFFSET: usize = 32;
+const RESERVED_TAIL: usize = 40;
 const CRC_LEN: usize = 4;
 
 const FRAME_KIND: usize = 0;
@@ -100,10 +123,23 @@ pub(crate) const KIND_COMMIT: u8 = 2;
 const IMAGE_PREFIX: usize = 24;
 const IMAGE_PAYLOAD_LEN: usize = IMAGE_PREFIX + PAGE_SIZE;
 const COMMIT_PAYLOAD_LEN: usize = 24;
+const IMAGE_FILE_PREFIX: u64 = (FRAME_HEADER_SIZE + IMAGE_PREFIX) as u64;
+
+/// Bytes counted for one committed version in [`Wal::index_bytes`].
+///
+/// The record is the page id, LSN, transaction id, and file offset. The
+/// per-page vector stores one extra `u32` index. Hash-map buckets are not
+/// included; they are a small constant factor of the page-id cardinality.
+pub const INDEX_RECORD_BYTES: usize = 32;
+
+/// Default cap on committed versions retained in the index.
+pub const DEFAULT_VERSION_LIMIT: usize = 1 << 20;
 
 const _: () = assert!(HEADER_SIZE == 64);
 const _: () = assert!(FILE_ID_OFFSET + FILE_ID_LEN == HEADER_CHECKSUM);
 const _: () = assert!(HEADER_TAIL == 32);
+const _: () = assert!(GENERATION_OFFSET == HEADER_TAIL);
+const _: () = assert!(RESERVED_TAIL == GENERATION_OFFSET + 8);
 const _: () = assert!(FRAME_HEADER_SIZE == 12);
 const _: () = assert!(IMAGE_PAYLOAD_LEN <= MAX_PAYLOAD);
 const _: () = assert!(COMMIT_PAYLOAD_LEN <= MAX_PAYLOAD);
@@ -143,6 +179,9 @@ pub enum WalError {
     /// The file handle returned an error.
     #[error("write-ahead log i/o failed")]
     Io(#[source] VfsError),
+    /// Another committed version would pass [`Wal::version_limit`].
+    #[error("write-ahead log index is full")]
+    Full,
 }
 
 impl From<VfsError> for WalError {
@@ -156,8 +195,13 @@ impl From<VfsError> for WalError {
 
 /// Sync requested for one commit.
 ///
-/// There is no group-commit variant. [`Self::Full`] syncs this commit.
-/// [`Self::None`] does not.
+/// [`Self::Full`] syncs this commit before it is acknowledged.
+/// [`Self::Grouped`] has the same guarantee; a lone committer syncs immediately
+/// because there is no second batch to wait for.
+/// [`Self::Deferred`] acknowledges after the frames are written and bounds the
+/// loss window by [`Storage::sync`](crate::Storage::sync) or a later flusher.
+/// [`Self::None`] records the commit and does not sync. It is the test mode
+/// with no flusher.
 ///
 /// # Examples
 ///
@@ -174,7 +218,20 @@ impl From<VfsError> for WalError {
 pub enum Durability {
     /// Sync the log before recording the commit.
     Full,
-    /// Record the commit and leave it unsynced.
+    /// Same durability as [`Self::Full`]. `max_delay` is the time a busier
+    /// committer may wait to share the sync. One committer does not wait.
+    Grouped {
+        /// Upper bound on the wait before the shared sync.
+        max_delay: Duration,
+    },
+    /// Record the commit without syncing. The loss window ends at the next
+    /// successful [`Wal::sync`].
+    Deferred {
+        /// How often a background flusher should sync. The engine stores the
+        /// interval; [`Wal::commit`] itself does not sleep.
+        flush_interval: Duration,
+    },
+    /// Record the commit and leave it unsynced. No flusher runs.
     None,
 }
 
@@ -258,7 +315,8 @@ pub enum WalFrame {
 ///
 /// wal.commit(Durability::Full, 1, Lsn::new(1), 1).unwrap();
 ///
-/// let page = &wal.pages()[0];
+/// let pages = wal.pages().unwrap();
+/// let page = &pages[0];
 /// assert_eq!(page.txn_id(), 1);
 /// assert_eq!(page.page_id(), PageId::new(4));
 /// assert_eq!(page.lsn(), Lsn::new(1));
@@ -382,15 +440,28 @@ struct PendingPage {
 /// assert_eq!(wal.durable_lsn(), Lsn::new(0));
 /// assert!(wal.pages().is_empty());
 /// ```
+#[derive(Clone, Copy, Debug)]
+struct Indexed {
+    txn_id: u64,
+    page_id: PageId,
+    lsn: Lsn,
+    image_offset: u64,
+}
+
 #[derive(Debug)]
 pub struct Wal<F: VfsFile> {
     file: F,
     file_id: [u8; FILE_ID_LEN],
+    generation: u64,
     append_offset: u64,
     synced_offset: u64,
     allocated_end: u64,
     durable_lsn: Lsn,
-    pages: Vec<CommittedPage>,
+    /// Committed versions in commit order. Page images stay in the file.
+    order: Vec<Indexed>,
+    /// Indexes into [`Self::order`], sorted by increasing LSN.
+    by_page: HashMap<PageId, Vec<u32>>,
+    version_limit: usize,
     pending: Vec<PendingPage>,
 }
 
@@ -440,11 +511,14 @@ impl<F: VfsFile> Wal<F> {
         Ok(Self {
             file,
             file_id,
+            generation: 1,
             append_offset: header_end,
             synced_offset: header_end,
             allocated_end: len.max(header_end),
             durable_lsn: Lsn::new(0),
-            pages: Vec::new(),
+            order: Vec::new(),
+            by_page: HashMap::new(),
+            version_limit: DEFAULT_VERSION_LIMIT,
             pending: Vec::new(),
         })
     }
@@ -497,23 +571,22 @@ impl<F: VfsFile> Wal<F> {
     /// assert_eq!(wal.pages()[0].image(), &image);
     /// ```
     pub fn open(mut file: F, file_id: [u8; FILE_ID_LEN]) -> Result<Self, WalError> {
-        let bytes = read_file(&mut file)?;
-
-        let recovery = recover(&bytes)?;
-        if recovery.file_id != file_id {
+        let replay = replay_file(&mut file)?;
+        if replay.file_id != file_id {
             return Err(WalError::FileIdMismatch);
         }
-
-        let allocated_end = u64::try_from(bytes.len()).map_err(|_| WalError::Torn)?;
 
         Ok(Self {
             file,
             file_id,
-            append_offset: recovery.valid_end,
-            synced_offset: recovery.valid_end,
-            allocated_end,
-            durable_lsn: recovery.durable_lsn,
-            pages: recovery.pages,
+            generation: replay.generation,
+            append_offset: replay.valid_end,
+            synced_offset: replay.valid_end,
+            allocated_end: replay.allocated_end,
+            durable_lsn: replay.durable_lsn,
+            order: replay.order,
+            by_page: replay.by_page,
+            version_limit: DEFAULT_VERSION_LIMIT,
             pending: Vec::new(),
         })
     }
@@ -569,6 +642,7 @@ impl<F: VfsFile> Wal<F> {
         image: &[u8],
     ) -> Result<(), WalError> {
         self.prepare_image(txn_id, page_id, lsn, image)?;
+        self.ensure_room()?;
 
         let payload = image_payload(txn_id, page_id, lsn, image)?;
         let offset = self.write_frame(KIND_PAGE_IMAGE, &payload)?;
@@ -643,13 +717,13 @@ impl<F: VfsFile> Wal<F> {
         self.write_frame(KIND_COMMIT, &payload)?;
 
         match durability {
-            Durability::Full => {
+            Durability::Full | Durability::Grouped { .. } => {
                 if let Err(err) = self.sync() {
                     self.discard_unsynced();
                     return Err(err);
                 }
             }
-            Durability::None => {}
+            Durability::None | Durability::Deferred { .. } => {}
         }
 
         self.publish(txn_id, lsn);
@@ -709,6 +783,26 @@ impl<F: VfsFile> Wal<F> {
         self.file_id
     }
 
+    /// Generation stored in the header. Reset advances it by one.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Bytes from the start of the file through the last accepted frame.
+    #[must_use]
+    pub const fn appended_bytes(&self) -> u64 {
+        self.append_offset
+    }
+
+    /// Whether a committed frame is still newer than `horizon`.
+    #[must_use]
+    pub(crate) fn retains_frames_above(&self, horizon: Lsn) -> bool {
+        self.order
+            .iter()
+            .any(|page| page.lsn.as_u64() > horizon.as_u64())
+    }
+
     /// Last recorded commit.
     ///
     /// After [`Durability::Full`] this LSN was synced. After [`Durability::None`]
@@ -720,9 +814,133 @@ impl<F: VfsFile> Wal<F> {
     }
 
     /// Images from commits recorded on this handle, in commit order.
+    ///
+    /// Each image is read from the file. The index itself does not retain it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] when a stored image cannot be read, and
+    /// [`WalError::Torn`] when the stored offset does not hold one page.
+    pub fn pages(&mut self) -> Result<Vec<CommittedPage>, WalError> {
+        let meta = self.order.clone();
+        let mut pages = Vec::with_capacity(meta.len());
+        for item in meta {
+            pages.push(CommittedPage {
+                txn_id: item.txn_id,
+                page_id: item.page_id,
+                lsn: item.lsn,
+                image: self.read_page(item.image_offset)?.to_vec(),
+            });
+        }
+        Ok(pages)
+    }
+
+    /// Committed versions retained in the index.
     #[must_use]
-    pub fn pages(&self) -> &[CommittedPage] {
-        &self.pages
+    pub fn version_count(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Cap used by [`Self::ensure_room`].
+    #[must_use]
+    pub const fn version_limit(&self) -> usize {
+        self.version_limit
+    }
+
+    /// Replace the version cap. A cap below the current count does not drop
+    /// versions; the next append fails with [`WalError::Full`].
+    pub fn set_version_limit(&mut self, limit: usize) {
+        self.version_limit = limit;
+    }
+
+    /// Bytes of the version records and per-page index vectors.
+    ///
+    /// See [`INDEX_RECORD_BYTES`]. Hash-map buckets are not included.
+    #[must_use]
+    pub fn index_bytes(&self) -> u64 {
+        let records = (self.order.len() * INDEX_RECORD_BYTES) as u64;
+        let lists: usize = self
+            .by_page
+            .values()
+            .map(|versions| versions.capacity() * core::mem::size_of::<u32>())
+            .sum();
+        records.saturating_add(lists as u64)
+    }
+
+    /// Newest committed LSN of `page_id` that is still visible at `snapshot`.
+    #[must_use]
+    pub fn newest_lsn(&self, page_id: PageId, snapshot: Lsn) -> Option<Lsn> {
+        self.locate(page_id, snapshot).map(|item| item.lsn)
+    }
+
+    /// Read the page image chosen by [`Self::newest_lsn`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] or [`WalError::Torn`] when the frame cannot be
+    /// read back.
+    pub fn read_visible(
+        &mut self,
+        page_id: PageId,
+        snapshot: Lsn,
+    ) -> Result<Option<[u8; PAGE_SIZE]>, WalError> {
+        let Some(item) = self.locate(page_id, snapshot) else {
+            return Ok(None);
+        };
+        let offset = item.image_offset;
+        Ok(Some(self.read_page(offset)?))
+    }
+
+    /// Distinct page ids that have a version at or below `snapshot`.
+    #[must_use]
+    pub fn page_ids(&self, snapshot: Lsn) -> Vec<PageId> {
+        let mut ids = Vec::new();
+        for item in &self.order {
+            if item.lsn <= snapshot && !ids.contains(&item.page_id) {
+                ids.push(item.page_id);
+            }
+        }
+        ids
+    }
+
+    fn locate(&self, page_id: PageId, snapshot: Lsn) -> Option<Indexed> {
+        let versions = self.by_page.get(&page_id)?;
+        let position = versions.partition_point(|&index| {
+            self.order
+                .get(index as usize)
+                .is_some_and(|item| item.lsn <= snapshot)
+        });
+        if position == 0 {
+            return None;
+        }
+        self.order.get(versions[position - 1] as usize).copied()
+    }
+
+    fn read_page(&mut self, offset: u64) -> Result<[u8; PAGE_SIZE], WalError> {
+        let mut image = [0u8; PAGE_SIZE];
+        self.file.read_exact(offset, &mut image)?;
+        Ok(image)
+    }
+
+    fn ensure_room(&self) -> Result<(), WalError> {
+        let next = self
+            .order
+            .len()
+            .saturating_add(self.pending.len())
+            .saturating_add(1);
+        if next > self.version_limit {
+            Err(WalError::Full)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record(&mut self, item: Indexed) {
+        let Ok(index) = u32::try_from(self.order.len()) else {
+            return;
+        };
+        self.by_page.entry(item.page_id).or_default().push(index);
+        self.order.push(item);
     }
 
     /// Raise the recorded commit floor without writing a frame.
@@ -736,65 +954,37 @@ impl<F: VfsFile> Wal<F> {
         }
     }
 
-    /// Drop published images at or below `horizon` and rewrite the file.
+    /// Drop the in-memory index once every frame is at or below `horizon`.
     ///
-    /// Images above `horizon` are written again as complete commits. The
-    /// recorded commit floor does not move backward. Pending images make the
-    /// call fail and leave the file unchanged.
+    /// The header generation increases by one and that header is synced. Frames
+    /// already in the file stay where they are. Their checksums include the old
+    /// generation, so a later open ignores them. When any frame is newer than
+    /// `horizon`, the file and the index are left unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`WalError::Corrupt`] when a commit is still pending, and
-    /// [`WalError::Io`] when the rewrite or its sync fails.
+    /// [`WalError::Io`] when the new header or its sync fails.
     pub(crate) fn prune(&mut self, horizon: Lsn) -> Result<(), WalError> {
         if !self.pending.is_empty() {
             return Err(WalError::Corrupt);
         }
 
-        let kept: Vec<CommittedPage> = self
-            .pages
-            .iter()
-            .filter(|page| page.lsn.as_u64() > horizon.as_u64())
-            .cloned()
-            .collect();
+        if self.retains_frames_above(horizon) {
+            return Ok(());
+        }
 
-        let header = encode_header(&self.file_id)?;
+        let generation = self.generation.checked_add(1).ok_or(WalError::Corrupt)?;
+        let header = encode_header_at(&self.file_id, generation)?;
         self.file.write_all(0, &header)?;
-
-        let mut offset = header_end()?;
-        let mut index = 0;
-        while index < kept.len() {
-            let txn_id = kept[index].txn_id;
-            let lsn = kept[index].lsn;
-            let start = index;
-            while index < kept.len() && kept[index].txn_id == txn_id && kept[index].lsn == lsn {
-                index += 1;
-            }
-
-            for page in &kept[start..index] {
-                let payload = image_payload(page.txn_id, page.page_id, page.lsn, &page.image)?;
-                let frame = encode_frame(KIND_PAGE_IMAGE, &payload)?;
-                self.file.write_all(offset, &frame)?;
-                offset = add_len(offset, frame.len())?;
-            }
-
-            let count = u64::try_from(index - start).map_err(|_| WalError::Corrupt)?;
-            let payload = commit_payload(txn_id, lsn, count)?;
-            let frame = encode_frame(KIND_COMMIT, &payload)?;
-            self.file.write_all(offset, &frame)?;
-            offset = add_len(offset, frame.len())?;
-        }
-
-        let tail = self.allocated_end.max(self.append_offset);
-        if tail > offset {
-            self.zero_range(offset, tail)?;
-        }
-
         self.file.sync()?;
-        self.append_offset = offset;
-        self.synced_offset = offset;
-        self.allocated_end = tail.max(offset);
-        self.pages = kept;
+
+        let end = header_end()?;
+        self.generation = generation;
+        self.append_offset = end;
+        self.synced_offset = end;
+        self.order.clear();
+        self.by_page.clear();
         Ok(())
     }
 
@@ -842,28 +1032,33 @@ impl<F: VfsFile> Wal<F> {
     }
 
     fn publish(&mut self, txn_id: u64, lsn: Lsn) {
+        let pending = std::mem::take(&mut self.pending);
         let mut kept = Vec::new();
+        let mut published = Vec::new();
 
-        for page in self.pending.drain(..) {
+        for page in pending {
             if page.txn_id == txn_id {
-                self.pages.push(CommittedPage {
+                published.push(Indexed {
                     txn_id: page.txn_id,
                     page_id: page.page_id,
                     lsn: page.lsn,
-                    image: page.image,
+                    image_offset: page.offset.saturating_add(IMAGE_FILE_PREFIX),
                 });
             } else {
                 kept.push(page);
             }
         }
 
+        for item in published {
+            self.record(item);
+        }
         self.pending = kept;
         self.durable_lsn = lsn;
     }
 
     fn write_frame(&mut self, kind: u8, payload: &[u8]) -> Result<u64, WalError> {
         let offset = self.append_offset;
-        let frame = encode_frame(kind, payload)?;
+        let frame = encode_frame_for(self.generation, kind, payload)?;
         self.file.write_all(offset, &frame)?;
 
         let end = add_len(offset, frame.len())?;
@@ -949,13 +1144,13 @@ impl<F: VfsFile> Wal<F> {
 /// assert!(recover(&bytes[..bytes.len() - 1]).unwrap().pages().is_empty());
 /// ```
 pub fn recover(bytes: &[u8]) -> Result<Recovery, WalError> {
-    let file_id = decode_header(bytes)?;
+    let meta = decode_meta(bytes)?;
     let mut pending: Vec<PendingPage> = Vec::new();
     let mut pages = Vec::new();
     let mut durable = 0u64;
     let mut offset = HEADER_SIZE;
 
-    while let Some((frame, len)) = read_frame(&bytes[offset..]) {
+    while let Some((frame, len)) = read_frame_for(meta.generation, &bytes[offset..]) {
         let Some(next) = offset.checked_add(len) else {
             break;
         };
@@ -1000,7 +1195,7 @@ pub fn recover(bytes: &[u8]) -> Result<Recovery, WalError> {
 
     let valid_end = u64::try_from(offset).map_err(|_| WalError::Corrupt)?;
     Ok(Recovery {
-        file_id,
+        file_id: meta.file_id,
         pages,
         durable_lsn: Lsn::new(durable),
         valid_end,
@@ -1044,7 +1239,16 @@ fn commit_matches(pending: &[PendingPage], txn_id: u64, lsn: Lsn, page_count: u6
     count == page_count
 }
 
+struct HeaderMeta {
+    file_id: [u8; FILE_ID_LEN],
+    generation: u64,
+}
+
 pub(crate) fn decode_header(bytes: &[u8]) -> Result<[u8; FILE_ID_LEN], WalError> {
+    Ok(decode_meta(bytes)?.file_id)
+}
+
+fn decode_meta(bytes: &[u8]) -> Result<HeaderMeta, WalError> {
     if bytes.len() < HEADER_SIZE {
         return Err(WalError::Torn);
     }
@@ -1079,14 +1283,18 @@ pub(crate) fn decode_header(bytes: &[u8]) -> Result<[u8; FILE_ID_LEN], WalError>
     }
 
     let reserved = u16::from_le_bytes([header[HEADER_RESERVED], header[HEADER_RESERVED + 1]]);
-    if reserved != 0 || header[HEADER_TAIL..].iter().any(|&byte| byte != 0) {
+    let generation = get_u64(header, GENERATION_OFFSET).map_err(|_| WalError::Corrupt)?;
+    if reserved != 0 || generation == 0 || header[RESERVED_TAIL..].iter().any(|&byte| byte != 0) {
         return Err(WalError::Corrupt);
     }
 
     let mut file_id = [0u8; FILE_ID_LEN];
     file_id.copy_from_slice(&header[FILE_ID_OFFSET..FILE_ID_OFFSET + FILE_ID_LEN]);
 
-    Ok(file_id)
+    Ok(HeaderMeta {
+        file_id,
+        generation,
+    })
 }
 
 pub(crate) fn restamp_header(
@@ -1097,12 +1305,24 @@ pub(crate) fn restamp_header(
         return Err(WalError::Torn);
     }
 
-    let header = encode_header(file_id)?;
+    let generation = decode_meta(bytes)?.generation;
+    let header = encode_header_at(file_id, generation)?;
     bytes[..HEADER_SIZE].copy_from_slice(&header);
     Ok(())
 }
 
 pub(crate) fn encode_header(file_id: &[u8; FILE_ID_LEN]) -> Result<[u8; HEADER_SIZE], WalError> {
+    encode_header_at(file_id, 1)
+}
+
+pub(crate) fn encode_header_at(
+    file_id: &[u8; FILE_ID_LEN],
+    generation: u64,
+) -> Result<[u8; HEADER_SIZE], WalError> {
+    if generation == 0 {
+        return Err(WalError::Corrupt);
+    }
+
     let mut header = [0u8; HEADER_SIZE];
     header[MAGIC_OFFSET..MAGIC_OFFSET + MAGIC.len()].copy_from_slice(&MAGIC);
     header[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&VERSION.to_le_bytes());
@@ -1110,6 +1330,7 @@ pub(crate) fn encode_header(file_id: &[u8; FILE_ID_LEN]) -> Result<[u8; HEADER_S
     let page_size = u32::try_from(PAGE_SIZE).map_err(|_| WalError::Corrupt)?;
     header[PAGE_SIZE_OFFSET..PAGE_SIZE_OFFSET + 4].copy_from_slice(&page_size.to_le_bytes());
     header[FILE_ID_OFFSET..FILE_ID_OFFSET + FILE_ID_LEN].copy_from_slice(file_id);
+    header[GENERATION_OFFSET..GENERATION_OFFSET + 8].copy_from_slice(&generation.to_le_bytes());
 
     let digest = Checksum::hash_skipping(&header, HEADER_CHECKSUM..HEADER_CHECKSUM + CRC_LEN)
         .map_err(|_| WalError::Corrupt)?;
@@ -1120,7 +1341,12 @@ pub(crate) fn encode_header(file_id: &[u8; FILE_ID_LEN]) -> Result<[u8; HEADER_S
     Ok(header)
 }
 
+#[cfg_attr(not(feature = "fuzzing"), allow(dead_code))]
 pub(crate) fn read_frame(bytes: &[u8]) -> Option<(WalFrame, usize)> {
+    read_frame_for(1, bytes)
+}
+
+fn read_frame_for(generation: u64, bytes: &[u8]) -> Option<(WalFrame, usize)> {
     if bytes.len() < FRAME_HEADER_SIZE {
         return None;
     }
@@ -1148,7 +1374,7 @@ pub(crate) fn read_frame(bytes: &[u8]) -> Option<(WalFrame, usize)> {
     let stored = read_u32(&header, FRAME_CHECKSUM).ok()?;
     header[FRAME_CHECKSUM..FRAME_CHECKSUM + CRC_LEN].fill(0);
 
-    let digest = frame_digest(&header, payload).ok()?;
+    let digest = frame_digest(generation, &header, payload).ok()?;
     if digest.as_u32() != stored {
         return None;
     }
@@ -1254,6 +1480,10 @@ fn commit_payload(
 }
 
 pub(crate) fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, WalError> {
+    encode_frame_for(1, kind, payload)
+}
+
+fn encode_frame_for(generation: u64, kind: u8, payload: &[u8]) -> Result<Vec<u8>, WalError> {
     if payload.is_empty() || payload.len() > MAX_PAYLOAD {
         return Err(WalError::Corrupt);
     }
@@ -1265,18 +1495,19 @@ pub(crate) fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, WalError
     put_u32(&mut frame, FRAME_LENGTH, payload_len).map_err(|_| WalError::Corrupt)?;
     frame[FRAME_HEADER_SIZE..].copy_from_slice(payload);
 
-    let digest = frame_digest(&frame[..FRAME_HEADER_SIZE], payload)?;
+    let digest = frame_digest(generation, &frame[..FRAME_HEADER_SIZE], payload)?;
     frame[FRAME_CHECKSUM..FRAME_CHECKSUM + CRC_LEN].copy_from_slice(&digest.as_u32().to_le_bytes());
 
     Ok(frame)
 }
 
-fn frame_digest(header: &[u8], payload: &[u8]) -> Result<Checksum, WalError> {
-    let mut bytes = Vec::with_capacity(header.len().saturating_add(payload.len()));
+fn frame_digest(generation: u64, header: &[u8], payload: &[u8]) -> Result<Checksum, WalError> {
+    let mut bytes = Vec::with_capacity(8 + header.len() + payload.len());
+    bytes.extend_from_slice(&generation.to_le_bytes());
     bytes.extend_from_slice(header);
     bytes.extend_from_slice(payload);
-    Checksum::hash_skipping(&bytes, FRAME_CHECKSUM..FRAME_CHECKSUM + CRC_LEN)
-        .map_err(|_| WalError::Corrupt)
+    let start = 8 + FRAME_CHECKSUM;
+    Checksum::hash_skipping(&bytes, start..start + CRC_LEN).map_err(|_| WalError::Corrupt)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, WalError> {
@@ -1290,14 +1521,143 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, WalError> {
     Ok(u32::from_le_bytes(raw))
 }
 
-fn read_file(file: &mut impl VfsFile) -> Result<Vec<u8>, WalError> {
-    let len = usize::try_from(file.len()?).map_err(|_| WalError::Torn)?;
-    let mut bytes = vec![0u8; len];
-    if len > 0 {
-        file.read_exact(0, &mut bytes)?;
+struct Replay {
+    file_id: [u8; FILE_ID_LEN],
+    generation: u64,
+    order: Vec<Indexed>,
+    by_page: HashMap<PageId, Vec<u32>>,
+    durable_lsn: Lsn,
+    valid_end: u64,
+    allocated_end: u64,
+}
+
+fn replay_file(file: &mut impl VfsFile) -> Result<Replay, WalError> {
+    let allocated_end = file.len()?;
+    if allocated_end < HEADER_SIZE as u64 {
+        return Err(WalError::Torn);
     }
 
-    Ok(bytes)
+    let mut header = [0u8; HEADER_SIZE];
+    file.read_exact(0, &mut header)?;
+    let meta = decode_meta(&header)?;
+    let mut order = Vec::new();
+    let mut by_page: HashMap<PageId, Vec<u32>> = HashMap::new();
+    let mut pending = Vec::new();
+    let mut durable = 0u64;
+    let mut offset = HEADER_SIZE as u64;
+
+    while offset < allocated_end {
+        let Some(frame_len) = frame_len_at(file, offset)? else {
+            break;
+        };
+        let mut frame = vec![0u8; frame_len];
+        if file.read_exact(offset, &mut frame).is_err() {
+            break;
+        }
+        let Some((parsed, _)) = read_frame_for(meta.generation, &frame) else {
+            break;
+        };
+        let Some(next) = offset.checked_add(frame_len as u64) else {
+            break;
+        };
+
+        match parsed {
+            WalFrame::PageImage {
+                txn_id,
+                page_id,
+                lsn,
+                image: _,
+            } => {
+                if lsn.as_u64() <= durable
+                    || pending
+                        .iter()
+                        .any(|page: &Indexed| page.txn_id == txn_id && page.page_id == page_id)
+                {
+                    break;
+                }
+                pending.push(Indexed {
+                    txn_id,
+                    page_id,
+                    lsn,
+                    image_offset: offset.saturating_add(IMAGE_FILE_PREFIX),
+                });
+                offset = next;
+            }
+            WalFrame::Commit {
+                txn_id,
+                lsn,
+                page_count,
+            } => {
+                if lsn.as_u64() <= durable || !replay_matches(&pending, txn_id, lsn, page_count) {
+                    break;
+                }
+                let mut kept = Vec::new();
+                for page in pending.drain(..) {
+                    if page.txn_id == txn_id {
+                        let Ok(index) = u32::try_from(order.len()) else {
+                            return Err(WalError::Full);
+                        };
+                        by_page.entry(page.page_id).or_default().push(index);
+                        order.push(page);
+                    } else {
+                        kept.push(page);
+                    }
+                }
+                pending = kept;
+                durable = lsn.as_u64();
+                offset = next;
+            }
+        }
+    }
+
+    Ok(Replay {
+        file_id: meta.file_id,
+        generation: meta.generation,
+        order,
+        by_page,
+        durable_lsn: Lsn::new(durable),
+        valid_end: offset,
+        allocated_end,
+    })
+}
+
+fn frame_len_at(file: &mut impl VfsFile, offset: u64) -> Result<Option<usize>, WalError> {
+    let mut header = [0u8; FRAME_HEADER_SIZE];
+    if file.read_exact(offset, &mut header).is_err() {
+        return Ok(None);
+    }
+    if header[FRAME_RESERVED..FRAME_LENGTH]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        return Ok(None);
+    }
+    let Ok(payload_len) = read_u32(&header, FRAME_LENGTH) else {
+        return Ok(None);
+    };
+    let Ok(payload_len) = usize::try_from(payload_len) else {
+        return Ok(None);
+    };
+    if payload_len == 0 || payload_len > MAX_PAYLOAD {
+        return Ok(None);
+    }
+    Ok(FRAME_HEADER_SIZE.checked_add(payload_len))
+}
+
+fn replay_matches(pending: &[Indexed], txn_id: u64, lsn: Lsn, page_count: u64) -> bool {
+    let mut count = 0u64;
+    let mut seen = Vec::new();
+    for page in pending {
+        if page.txn_id != txn_id {
+            continue;
+        }
+        if page.lsn != lsn || seen.contains(&page.page_id) {
+            return false;
+        }
+        seen.push(page.page_id);
+        count = count.saturating_add(1);
+    }
+    count == page_count
 }
 
 fn zero_between(file: &mut impl VfsFile, start: u64, end: u64) -> Result<(), WalError> {
@@ -1326,8 +1686,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CommittedPage, Durability, HEADER_CHECKSUM, HEADER_SIZE, HEADER_TAIL, MAGIC, VERSION,
-        VERSION_OFFSET, Wal, WalError, decode_header, encode_frame, encode_header, recover,
+        CommittedPage, Durability, HEADER_CHECKSUM, HEADER_SIZE, INDEX_RECORD_BYTES, MAGIC,
+        RESERVED_TAIL, VERSION, VERSION_OFFSET, Wal, WalError, decode_header, encode_frame,
+        encode_header, recover,
     };
     use crate::checksum::Checksum;
     use crate::page::{Lsn, PAGE_SIZE, PageHeader, PageId, PageKind};
@@ -1413,10 +1774,10 @@ mod tests {
                 &OpenOptions::new().create(true),
             )
             .unwrap();
-        let wal = Wal::create(file, [7; 16]).unwrap();
+        let mut wal = Wal::create(file, [7; 16]).unwrap();
         assert_eq!(wal.file_id(), [7; 16]);
         assert_eq!(wal.durable_lsn(), Lsn::new(0));
-        assert!(wal.pages().is_empty());
+        assert!(wal.pages().unwrap().is_empty());
     }
 
     #[test]
@@ -1433,7 +1794,7 @@ mod tests {
         let image = leaf(4, 1, 0x11);
         wal.append_page_image(1, PageId::new(4), Lsn::new(1), &image)
             .unwrap();
-        assert!(wal.pages().is_empty());
+        assert!(wal.pages().unwrap().is_empty());
         assert_eq!(wal.durable_lsn(), Lsn::new(0));
     }
 
@@ -1453,8 +1814,9 @@ mod tests {
             .unwrap();
         wal.commit(Durability::Full, 1, Lsn::new(1), 1).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages().len(), 1);
-        let page = &wal.pages()[0];
+        let pages = wal.pages().unwrap();
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
         assert_eq!(page.txn_id(), 1);
         assert_eq!(page.page_id(), PageId::new(4));
         assert_eq!(page.lsn(), Lsn::new(1));
@@ -1477,7 +1839,7 @@ mod tests {
             .unwrap();
         wal.sync().unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(0));
-        assert!(wal.pages().is_empty());
+        assert!(wal.pages().unwrap().is_empty());
     }
 
     #[test]
@@ -1495,9 +1857,9 @@ mod tests {
         drop(wal);
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, [7; 16]).unwrap();
+        let mut wal = Wal::open(file, [7; 16]).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages()[0].image(), &image);
+        assert_eq!(wal.pages().unwrap()[0].image(), &image);
     }
 
     #[test]
@@ -1618,26 +1980,26 @@ mod tests {
         vfs.replace(path, FileRole::Wal, &bytes).unwrap();
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, FILE_ID).unwrap();
+        let mut wal = Wal::open(file, FILE_ID).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages(), &[committed(1, 4, 1, &first)]);
+        assert_eq!(wal.pages().unwrap(), &[committed(1, 4, 1, &first)]);
         drop(wal);
 
         let mut checksum = bytes.clone();
         checksum[good_end + 20] ^= 0x01;
         vfs.replace(path, FileRole::Wal, &checksum).unwrap();
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, FILE_ID).unwrap();
-        assert_eq!(wal.pages().len(), 1);
+        let mut wal = Wal::open(file, FILE_ID).unwrap();
+        assert_eq!(wal.pages().unwrap().len(), 1);
         drop(wal);
 
         let mut truncated = bytes[..good_end + 4].to_vec();
         truncated.extend(encode_frame(2, &commit_bytes(2, 2, 1)).unwrap());
         vfs.replace(path, FileRole::Wal, &truncated).unwrap();
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, FILE_ID).unwrap();
+        let mut wal = Wal::open(file, FILE_ID).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages().len(), 1);
+        assert_eq!(wal.pages().unwrap().len(), 1);
     }
 
     #[test]
@@ -1665,14 +2027,14 @@ mod tests {
         let err = wal.commit(Durability::Full, 1, Lsn::new(1), 1).unwrap_err();
         assert!(matches!(err, WalError::Io(_)), "{err}");
         assert_eq!(wal.durable_lsn(), Lsn::new(0));
-        assert!(wal.pages().is_empty());
+        assert!(wal.pages().unwrap().is_empty());
 
         let retry = leaf(4, 1, 0x22);
         wal.append_page_image(1, PageId::new(4), Lsn::new(1), &retry)
             .unwrap();
         wal.commit(Durability::Full, 1, Lsn::new(1), 1).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages()[0].image(), &retry);
+        assert_eq!(wal.pages().unwrap()[0].image(), &retry);
     }
 
     #[test]
@@ -1700,14 +2062,14 @@ mod tests {
         let err = wal.commit(Durability::Full, 2, Lsn::new(2), 1).unwrap_err();
         assert!(matches!(err, WalError::Io(_)), "{err}");
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages().len(), 1);
+        assert_eq!(wal.pages().unwrap().len(), 1);
         drop(wal);
         vfs.inner().crash();
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, FILE_ID).unwrap();
+        let mut wal = Wal::open(file, FILE_ID).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages(), &[committed(1, 4, 1, &first)]);
+        assert_eq!(wal.pages().unwrap(), &[committed(1, 4, 1, &first)]);
     }
 
     #[test]
@@ -1731,9 +2093,9 @@ mod tests {
         vfs.crash();
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, FILE_ID).unwrap();
+        let mut wal = Wal::open(file, FILE_ID).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(1));
-        assert_eq!(wal.pages(), &[committed(1, 4, 1, &durable)]);
+        assert_eq!(wal.pages().unwrap(), &[committed(1, 4, 1, &durable)]);
     }
 
     #[test]
@@ -1752,15 +2114,23 @@ mod tests {
         vfs.crash();
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
-        let wal = Wal::open(file, FILE_ID).unwrap();
+        let mut wal = Wal::open(file, FILE_ID).unwrap();
         assert_eq!(wal.durable_lsn(), Lsn::new(0));
-        assert!(wal.pages().is_empty());
+        assert!(wal.pages().unwrap().is_empty());
     }
 
     #[test]
     fn header_rejects_a_foreign_version_magic_and_file_id() {
         let mut header = encode_header(&FILE_ID).unwrap();
-        header[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&2u16.to_le_bytes());
+        header[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&1u16.to_le_bytes());
+        reseal_header(&mut header);
+        assert!(matches!(
+            decode_header(&header),
+            Err(WalError::UnsupportedVersion)
+        ));
+
+        header = encode_header(&FILE_ID).unwrap();
+        header[VERSION_OFFSET..VERSION_OFFSET + 2].copy_from_slice(&99u16.to_le_bytes());
         reseal_header(&mut header);
         assert!(matches!(
             decode_header(&header),
@@ -1779,7 +2149,7 @@ mod tests {
         ));
 
         header = encode_header(&FILE_ID).unwrap();
-        header[HEADER_TAIL] = 1;
+        header[RESERVED_TAIL] = 1;
         reseal_header(&mut header);
         assert!(matches!(decode_header(&header), Err(WalError::Corrupt)));
 
@@ -1850,31 +2220,76 @@ mod tests {
 
         wal.prune(Lsn::new(1)).unwrap();
 
+        assert_eq!(wal.generation(), 1);
         assert_eq!(wal.durable_lsn(), Lsn::new(2));
-        assert_eq!(wal.pages().len(), 1);
-        assert_eq!(wal.pages()[0].page_id(), PageId::new(5));
+        assert_eq!(wal.pages().unwrap().len(), 2);
         drop(wal);
 
         let bytes = snapshot(&vfs, path);
         let recovered = recover(&bytes).unwrap();
         assert_eq!(recovered.durable_lsn(), Lsn::new(2));
-        assert_eq!(recovered.pages().len(), 1);
-        assert_eq!(recovered.pages()[0].image(), &second);
+        assert_eq!(recovered.pages().len(), 2);
+        assert_eq!(recovered.pages()[1].image(), &second);
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
         let mut reopened = Wal::open(file, FILE_ID).unwrap();
         reopened.adopt_floor(Lsn::new(1));
         assert_eq!(reopened.durable_lsn(), Lsn::new(2));
         reopened.prune(Lsn::new(2)).unwrap();
+        assert_eq!(reopened.generation(), 2);
         assert_eq!(reopened.durable_lsn(), Lsn::new(2));
-        assert!(reopened.pages().is_empty());
+        assert!(reopened.pages().unwrap().is_empty());
         drop(reopened);
+        let stale = snapshot(&vfs, path);
+        assert!(stale.len() > HEADER_SIZE);
+        assert!(recover(&stale).unwrap().pages().is_empty());
 
         let file = vfs.open(path, FileRole::Wal, &OpenOptions::new()).unwrap();
         let mut adopted = Wal::open(file, FILE_ID).unwrap();
         assert_eq!(adopted.durable_lsn(), Lsn::new(0));
         adopted.adopt_floor(Lsn::new(2));
         assert_eq!(adopted.durable_lsn(), Lsn::new(2));
+    }
+
+    #[test]
+    fn the_index_stays_smaller_than_the_file_and_lookup_is_per_page() {
+        let vfs = MemoryVfs::new();
+        let file = vfs
+            .open(
+                Path::new("index.wal"),
+                FileRole::Wal,
+                &OpenOptions::new().create(true),
+            )
+            .unwrap();
+        let mut wal = Wal::create(file, FILE_ID).unwrap();
+        wal.set_version_limit(3);
+        for version in 1..=3 {
+            let image = leaf(4, version, version as u8);
+            wal.append_page_image(version, PageId::new(4), Lsn::new(version), &image)
+                .unwrap();
+            wal.commit(Durability::None, version, Lsn::new(version), 1)
+                .unwrap();
+        }
+        let overflow = leaf(5, 4, 9);
+        let err = wal
+            .append_page_image(4, PageId::new(5), Lsn::new(4), &overflow)
+            .unwrap_err();
+        assert!(matches!(err, WalError::Full));
+        assert_eq!(wal.version_limit(), 3);
+        assert_eq!(wal.version_count(), 3);
+        let file_pages = wal.pages().unwrap();
+        assert!(wal.index_bytes() < file_pages.len() as u64 * PAGE_SIZE as u64);
+        assert!(wal.index_bytes() >= file_pages.len() as u64 * INDEX_RECORD_BYTES as u64);
+        assert_eq!(
+            wal.newest_lsn(PageId::new(4), Lsn::new(2)),
+            Some(Lsn::new(2))
+        );
+        assert_eq!(wal.newest_lsn(PageId::new(5), Lsn::new(4)), None);
+        let visible = wal
+            .read_visible(PageId::new(4), Lsn::new(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible, leaf(4, 2, 2));
     }
 
     #[test]

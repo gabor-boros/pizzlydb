@@ -44,10 +44,9 @@
 //! assert_eq!(&buf, b"page");
 //! ```
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::vfs::{
     FileRole, OpenOptions, Vfs, VfsError, VfsFile, io_error, read_only_error, validate_open,
@@ -150,6 +149,7 @@ struct SimFile {
     unsynced: Vec<Write>,
     open_count: usize,
     name_durable: bool,
+    truncate_to: Option<usize>,
 }
 
 impl SimFile {
@@ -160,6 +160,7 @@ impl SimFile {
             unsynced: Vec::new(),
             open_count: 1,
             name_durable: false,
+            truncate_to: None,
         }
     }
 }
@@ -227,7 +228,7 @@ struct Inner {
 /// ```
 #[derive(Clone, Debug)]
 pub struct CrashSimVfs {
-    inner: Rc<RefCell<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl CrashSimVfs {
@@ -257,7 +258,7 @@ impl CrashSimVfs {
 
     fn from_state(state: SimState, capture: bool) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 state,
                 capture,
                 images: Vec::new(),
@@ -277,7 +278,7 @@ impl CrashSimVfs {
     /// Reads are not counted. A crash does not add an operation.
     #[must_use]
     pub fn operation_count(&self) -> u64 {
-        self.inner.borrow().state.op_count
+        self.inner.lock().expect("crash vfs").state.op_count
     }
 
     /// Make the next [`VfsFile::sync`](crate::VfsFile::sync) fail as `fault`.
@@ -315,7 +316,7 @@ impl CrashSimVfs {
     /// assert!(restored.is_empty().unwrap());
     /// ```
     pub fn arm_fsync_fault(&self, fault: FsyncFault) {
-        self.inner.borrow_mut().state.fault = Some(fault);
+        self.inner.lock().expect("crash vfs").state.fault = Some(fault);
     }
 
     /// Apply one seeded crash to the current unsynced bytes and pending names.
@@ -354,12 +355,12 @@ impl CrashSimVfs {
     /// assert_eq!(&buf, b"ab");
     /// ```
     pub fn crash(&self, seed: u64) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("crash vfs");
         inner.state.crash(seed);
     }
 
     fn note_mutation(&self) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("crash vfs");
         inner.state.op_count = inner.state.op_count.wrapping_add(1);
         if inner.capture {
             let image = inner.state.clone();
@@ -483,6 +484,11 @@ fn persisted_image(
     for piece in chosen {
         apply_bytes(&mut image, piece.offset, &piece.bytes);
     }
+    if let Some(len) = file.truncate_to
+        && rng.bool()
+    {
+        image.truncate(len);
+    }
     image
 }
 
@@ -502,6 +508,10 @@ fn apply_bytes(image: &mut Vec<u8>, offset: u64, bytes: &[u8]) {
 fn apply_unsynced(file: &mut SimFile) {
     for write in std::mem::take(&mut file.unsynced) {
         apply_bytes(&mut file.durable, write.offset, &write.bytes);
+    }
+    if let Some(len) = file.truncate_to.take() {
+        file.durable.truncate(len);
+        file.visible.truncate(len);
     }
 }
 
@@ -617,7 +627,7 @@ where
 {
     let vfs = CrashSimVfs::capturing(config);
     workload(&vfs);
-    let images = vfs.inner.borrow().images.clone();
+    let images = vfs.inner.lock().expect("crash vfs").images.clone();
     for image in &images {
         let op = image.op_count;
         for sample in 0..samples {
@@ -641,7 +651,7 @@ impl Vfs for CrashSimVfs {
         validate_open(path, options)?;
         let key = (path.to_path_buf(), role);
         let created = {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock().expect("crash vfs");
             match inner.state.files.get_mut(&key) {
                 Some(file) => {
                     if options.is_exclusive() {
@@ -665,9 +675,9 @@ impl Vfs for CrashSimVfs {
         if created {
             self.note_mutation();
         }
-        let generation = self.inner.borrow().state.generation;
+        let generation = self.inner.lock().expect("crash vfs").state.generation;
         Ok(CrashFile {
-            inner: Rc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
             vfs: self.clone(),
             key,
             generation,
@@ -679,7 +689,7 @@ impl Vfs for CrashSimVfs {
     fn sync_dir(&self, directory: &Path) -> Result<(), VfsError> {
         validate_path(directory)?;
         {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock().expect("crash vfs");
             for file in inner.state.files.values_mut() {
                 file.name_durable = true;
             }
@@ -697,7 +707,7 @@ impl Vfs for CrashSimVfs {
         }
 
         {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock().expect("crash vfs");
             let state = &mut inner.state;
             if let Some(op) = state.pending.last()
                 && op.from == to_key
@@ -743,7 +753,7 @@ impl Vfs for CrashSimVfs {
     fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError> {
         let key = file_key(path, role)?;
         {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock().expect("crash vfs");
             let open_count = inner
                 .state
                 .files
@@ -767,7 +777,7 @@ impl Vfs for CrashSimVfs {
 /// Handle for one file in a [`CrashSimVfs`].
 #[derive(Debug)]
 pub struct CrashFile {
-    inner: Rc<RefCell<Inner>>,
+    inner: Arc<Mutex<Inner>>,
     vfs: CrashSimVfs,
     key: (PathBuf, FileRole),
     generation: u64,
@@ -783,7 +793,7 @@ impl CrashFile {
         if !self.open {
             return Err(io_error("file is closed"));
         }
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("crash vfs");
         if inner.state.generation != self.generation {
             return Err(io_error("file handle is stale"));
         }
@@ -800,7 +810,7 @@ impl CrashFile {
             return;
         }
         self.open = false;
-        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+        let Ok(mut inner) = self.inner.try_lock() else {
             return;
         };
         if inner.state.generation != self.generation {
@@ -860,7 +870,7 @@ impl VfsFile for CrashFile {
     }
 
     fn sync(&mut self) -> Result<(), VfsError> {
-        let fault = self.inner.borrow_mut().state.fault.take();
+        let fault = self.inner.lock().expect("crash vfs").state.fault.take();
         let result = self.with_open_file(|file| match fault {
             Some(FsyncFault::DiscardOnce) => {
                 file.unsynced.clear();
@@ -882,6 +892,31 @@ impl VfsFile for CrashFile {
         self.with_open_file(|file| {
             u64::try_from(file.visible.len()).map_err(|_| io_error("length overflow"))
         })
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<(), VfsError> {
+        if self.read_only {
+            return Err(read_only_error());
+        }
+        self.with_open_file(|file| {
+            let new_len = usize::try_from(len).map_err(|_| io_error("length overflow"))?;
+            if new_len > file.visible.len() {
+                let offset =
+                    u64::try_from(file.visible.len()).map_err(|_| io_error("length overflow"))?;
+                let zeros = vec![0u8; new_len - file.visible.len()];
+                file.visible.resize(new_len, 0);
+                file.unsynced.push(Write {
+                    offset,
+                    bytes: zeros,
+                });
+            } else {
+                file.visible.truncate(new_len);
+                file.truncate_to = Some(new_len);
+            }
+            Ok(())
+        })?;
+        self.vfs.note_mutation();
+        Ok(())
     }
 
     fn close(mut self) -> Result<(), VfsError> {
@@ -947,7 +982,7 @@ mod tests {
             vfs.sync_dir(Path::new(".")).unwrap();
         }
         let final_op = vfs.operation_count();
-        let images = vfs.inner.borrow().images.clone();
+        let images = vfs.inner.lock().expect("crash vfs").images.clone();
         let finished = images.iter().filter(|image| image.op_count == final_op);
         let mut checked = 0;
         for image in finished {
@@ -1005,7 +1040,14 @@ mod tests {
         file.write_all(0, b"abcdef").unwrap();
         drop(file);
         vfs.sync_dir(Path::new(".")).unwrap();
-        let image = vfs.inner.borrow().images.last().cloned().unwrap();
+        let image = vfs
+            .inner
+            .lock()
+            .expect("crash vfs")
+            .images
+            .last()
+            .cloned()
+            .unwrap();
         let seed = crash_seed(image.op_count, 3);
         let left = CrashSimVfs::from_image(config, &image);
         let right = CrashSimVfs::from_image(config, &image);

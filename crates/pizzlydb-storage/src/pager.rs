@@ -24,19 +24,21 @@
 //! [`PagerStats`] counts hits, misses, evictions, and I/O. Those counters are
 //! not a durability signal.
 //!
-//! [`Pager`] is not [`Sync`]. One thread mutates it. [`Pin`] and
-//! [`SnapshotGuard`] borrow that pager and are not [`Sync`] either. Move the
-//! pager to another thread only when no guard is alive.
+//! [`Pager`] is [`Sync`]. Frame images and the pager state each sit behind a
+//! mutex. A pin holds its frame lock only while [`Pin::bytes`] is alive. The
+//! state mutex is not held across that borrow. [`Pin`] and [`SnapshotGuard`]
+//! borrow the pager and are [`Send`] when the files are.
 
-use std::cell::{Ref, RefCell};
+use std::collections::HashMap;
 use std::ops::Deref;
+use std::sync::{Mutex, MutexGuard};
 
 use thiserror::Error;
 
 use crate::codec::{CodecError, put_u64};
 use crate::page::{LSN_OFFSET, Lsn, PAGE_SIZE, PageHeader, PageId, seal};
 use crate::vfs::{VfsError, VfsFile};
-use crate::wal::{CommittedPage, Durability, Wal, WalError};
+use crate::wal::{Durability, Wal, WalError};
 
 /// Failure while pinning, admitting, or publishing a page image.
 ///
@@ -57,8 +59,8 @@ pub enum PagerError {
     #[error("snapshot is not registered")]
     SnapshotNotFound,
     /// The page image failed its CRC-32C check.
-    #[error("page checksum mismatch")]
-    ChecksumMismatch,
+    #[error("page {page_id} checksum mismatch")]
+    ChecksumMismatch { page_id: u64 },
     /// The image is the wrong length, has a bad header, or its page id does not
     /// match the requested page. Also returned when the committed LSN cannot
     /// advance.
@@ -217,8 +219,8 @@ impl PagerStats {
 /// ```
 #[must_use = "dropping the pager drops both files and does not sync them"]
 pub struct Pager<M: VfsFile, W: VfsFile> {
-    frames: Vec<RefCell<[u8; PAGE_SIZE]>>,
-    state: RefCell<State<M, W>>,
+    frames: Vec<Mutex<[u8; PAGE_SIZE]>>,
+    state: Mutex<State<M, W>>,
 }
 
 impl<M: VfsFile, W: VfsFile> Pager<M, W> {
@@ -265,21 +267,24 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
 
         let mut frames = Vec::with_capacity(frame_count);
         for _ in 0..frame_count {
-            frames.push(RefCell::new([0u8; PAGE_SIZE]));
+            frames.push(Mutex::new([0u8; PAGE_SIZE]));
         }
 
         let committed_lsn = wal.durable_lsn();
+        let recovered_frames = u64::try_from(wal.version_count()).unwrap_or(u64::MAX);
         Ok(Self {
             frames,
-            state: RefCell::new(State {
+            state: Mutex::new(State {
                 main,
                 wal,
                 meta: vec![FrameMeta::empty(); frame_count],
+                by_page: HashMap::new(),
                 clock_hand: 0,
                 snapshots: Vec::new(),
                 next_snapshot_id: 1,
                 next_txn_id: 1,
                 committed_lsn,
+                recovered_frames,
                 stats: PagerStats::default(),
             }),
         })
@@ -324,7 +329,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// ```
     pub fn snapshot(&self) -> SnapshotGuard<'_, M, W> {
         let (id, lsn) = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock().expect("pager");
             let id = state.next_snapshot_id;
             state.next_snapshot_id = state.next_snapshot_id.saturating_add(1);
 
@@ -401,7 +406,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     pub fn pin(&self, page_id: PageId, lsn: Lsn) -> Result<Pin<'_, M, W>, PagerError> {
         let frames = &self.frames;
         let index = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock().expect("pager");
             if !state.registered(lsn) {
                 return Err(PagerError::SnapshotNotFound);
             }
@@ -479,7 +484,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// ```
     pub fn pin_dirty(&self, page_id: PageId) -> Result<Pin<'_, M, W>, PagerError> {
         let index = {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock().expect("pager");
 
             let index = state
                 .meta
@@ -537,7 +542,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// ```
     #[must_use]
     pub fn snapshot_lsn(&self) -> Lsn {
-        let state = self.state.borrow();
+        let state = self.state.lock().expect("pager");
         let oldest = state.snapshots.iter().map(|(_, lsn)| *lsn).min();
         oldest.unwrap_or_else(|| next_lsn(state.committed_lsn))
     }
@@ -574,7 +579,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// ```
     #[must_use]
     pub fn stats(&self) -> PagerStats {
-        self.state.borrow().stats
+        self.state.lock().expect("pager").stats
     }
 
     /// Publish `pin`'s dirty image.
@@ -633,7 +638,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// ```
     pub fn commit_frame(&self, pin: &Pin<'_, M, W>) -> Result<Lsn, PagerError> {
         let frames = &self.frames;
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("pager");
         let (page_id, current_lsn, dirty) = {
             let frame = &state.meta[pin.index];
             (frame.page_id, frame.lsn, frame.dirty)
@@ -654,7 +659,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
 
         let mut image = {
             let slot = frames[pin.index]
-                .try_borrow_mut()
+                .try_lock()
                 .map_err(|_| PagerError::Shared)?;
             *slot
         };
@@ -668,7 +673,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
             .append_page_image(txn_id, page_id, new_lsn, &image)?;
 
         state.wal.commit(Durability::Full, txn_id, new_lsn, 1)?;
-        *frames[pin.index].borrow_mut() = image;
+        *frames[pin.index].lock().expect("pager") = image;
 
         state.meta[pin.index].lsn = new_lsn;
         state.meta[pin.index].dirty = false;
@@ -734,14 +739,14 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     pub fn write_main(&self, pin: &Pin<'_, M, W>) -> Result<(), PagerError> {
         let frames = &self.frames;
         let (page_id, image) = {
-            let state = self.state.borrow();
+            let state = self.state.lock().expect("pager");
             let page_id = state.meta[pin.index].page_id;
-            let image = *frames[pin.index].borrow();
+            let image = *frames[pin.index].lock().expect("pager");
             (page_id, image)
         };
 
         let offset = page_offset(page_id)?;
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("pager");
         state.main.write_all(offset, &image)?;
         bump(&mut state.stats.write_io);
         state.meta[pin.index].durable_main = true;
@@ -752,7 +757,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// Last published commit sequence.
     #[must_use]
     pub(crate) fn committed_lsn(&self) -> Lsn {
-        self.state.borrow().committed_lsn
+        self.state.lock().expect("pager").committed_lsn
     }
 
     /// Bytes of `page_id` visible at `snapshot`, without checking the header.
@@ -769,11 +774,11 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
         snapshot: Lsn,
     ) -> Result<[u8; PAGE_SIZE], PagerError> {
         let from_log = {
-            let state = self.state.borrow();
+            let mut state = self.state.lock().expect("pager");
             if !state.registered(snapshot) {
                 return Err(PagerError::SnapshotNotFound);
             }
-            state.wal_image(page_id, snapshot)?
+            state.wal.read_visible(page_id, snapshot)?
         };
         if let Some(bytes) = from_log {
             return Ok(bytes);
@@ -782,7 +787,8 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
         let offset = page_offset(page_id)?;
         let mut bytes = [0u8; PAGE_SIZE];
         self.state
-            .borrow_mut()
+            .lock()
+            .expect("pager")
             .main
             .read_exact(offset, &mut bytes)?;
         Ok(bytes)
@@ -794,14 +800,15 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     ///
     /// Returns [`PagerError::Io`] when the length cannot be read.
     pub(crate) fn main_len(&self) -> Result<u64, PagerError> {
-        Ok(self.state.borrow().main.len()?)
+        Ok(self.state.lock().expect("pager").main.len()?)
     }
 
     /// Oldest registered snapshot, if any guard is alive.
     #[must_use]
     pub(crate) fn oldest_snapshot(&self) -> Option<Lsn> {
         self.state
-            .borrow()
+            .lock()
+            .expect("pager")
             .snapshots
             .iter()
             .map(|(_, lsn)| *lsn)
@@ -811,14 +818,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// Page ids that have a published log image at or before `snapshot`.
     #[must_use]
     pub(crate) fn wal_page_ids(&self, snapshot: Lsn) -> Vec<PageId> {
-        let state = self.state.borrow();
-        let mut ids = Vec::new();
-        for page in state.wal.pages() {
-            if page.lsn() <= snapshot && !ids.contains(&page.page_id()) {
-                ids.push(page.page_id());
-            }
-        }
-        ids
+        self.state.lock().expect("pager").wal.page_ids(snapshot)
     }
 
     /// Publish every image in one log transaction.
@@ -843,7 +843,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
             return Err(PagerError::Corrupt);
         }
 
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("pager");
         let new_lsn = next_lsn(state.committed_lsn);
         if new_lsn.as_u64() == state.committed_lsn.as_u64() {
             return Err(PagerError::Corrupt);
@@ -877,7 +877,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     ///
     /// Returns [`PagerError::Io`] when the handle's sync fails.
     pub(crate) fn sync_main(&self) -> Result<(), PagerError> {
-        self.state.borrow_mut().main.sync()?;
+        self.state.lock().expect("pager").main.sync()?;
         Ok(())
     }
 
@@ -888,7 +888,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// Returns [`PagerError::Wal`] when the log sync fails. The recorded
     /// sequence is unchanged.
     pub(crate) fn sync_wal(&self) -> Result<(), PagerError> {
-        self.state.borrow_mut().wal.sync()?;
+        self.state.lock().expect("pager").wal.sync()?;
         Ok(())
     }
 
@@ -906,7 +906,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
         }
 
         let offset = page_offset(page_id)?;
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("pager");
         state.main.write_all(offset, image)?;
         bump(&mut state.stats.write_io);
 
@@ -923,7 +923,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     ///
     /// A log whose recorded sequence is below `checkpoint` is [`PagerError::Corrupt`].
     pub(crate) fn recover_floor(&self, checkpoint: Lsn) -> Result<(), PagerError> {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock().expect("pager");
         let durable = state.wal.durable_lsn();
         if durable.as_u64() == 0 {
             state.wal.adopt_floor(checkpoint);
@@ -946,8 +946,34 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     ///
     /// Returns [`PagerError::Wal`] when the rewrite fails.
     pub(crate) fn prune_wal(&self, horizon: Lsn) -> Result<(), PagerError> {
-        self.state.borrow_mut().wal.prune(horizon)?;
+        self.state.lock().expect("pager").wal.prune(horizon)?;
         Ok(())
+    }
+
+    /// Log generation currently stored in the header.
+    pub(crate) fn wal_generation(&self) -> u64 {
+        self.state.lock().expect("pager").wal.generation()
+    }
+
+    /// Bytes accepted into the log, including the header.
+    ///
+    /// # Errors
+    ///
+    /// The length is kept in memory. This call does not read the file.
+    pub(crate) fn wal_appended_bytes(&self) -> Result<u64, PagerError> {
+        Ok(self.state.lock().expect("pager").wal.appended_bytes())
+    }
+
+    /// Committed frames recovered when the pager was opened.
+    #[must_use]
+    pub(crate) fn recovered_frames(&self) -> u64 {
+        self.state.lock().expect("pager").recovered_frames
+    }
+
+    /// Registered snapshot guards.
+    #[must_use]
+    pub(crate) fn snapshot_count(&self) -> usize {
+        self.state.lock().expect("pager").snapshots.len()
     }
 }
 
@@ -1049,9 +1075,8 @@ impl<M: VfsFile, W: VfsFile> Pin<'_, M, W> {
     /// ```
     #[must_use = "dropping the view releases the byte borrow"]
     pub fn bytes(&self) -> Bytes<'_> {
-        let borrowed = self.pager.frames[self.index].borrow();
         Bytes {
-            inner: Ref::map(borrowed, |bytes| &bytes[..]),
+            inner: self.pager.frames[self.index].lock().expect("pager frame"),
         }
     }
 
@@ -1109,7 +1134,7 @@ impl<M: VfsFile, W: VfsFile> Pin<'_, M, W> {
     /// assert!(matches!(err, PagerError::PoolExhausted));
     /// ```
     pub fn mark_dirty(&self) {
-        let mut state = self.pager.state.borrow_mut();
+        let mut state = self.pager.state.lock().expect("pager");
         let frame = &mut state.meta[self.index];
         frame.dirty = true;
         frame.durable_main = false;
@@ -1178,7 +1203,7 @@ impl<M: VfsFile, W: VfsFile> Pin<'_, M, W> {
     pub fn replace(&self, image: &[u8]) -> Result<(), PagerError> {
         let bytes = copy_page(image)?;
         let page_id = {
-            let state = self.pager.state.borrow();
+            let state = self.pager.state.lock().expect("pager");
             let frame = &state.meta[self.index];
             if frame.pin_count != 1 {
                 return Err(PagerError::Shared);
@@ -1189,12 +1214,12 @@ impl<M: VfsFile, W: VfsFile> Pin<'_, M, W> {
         let header = decode_page(&bytes, page_id)?;
         {
             let mut slot = self.pager.frames[self.index]
-                .try_borrow_mut()
+                .try_lock()
                 .map_err(|_| PagerError::Shared)?;
             *slot = bytes;
         }
 
-        let mut state = self.pager.state.borrow_mut();
+        let mut state = self.pager.state.lock().expect("pager");
         let frame = &mut state.meta[self.index];
         frame.lsn = header.lsn();
         frame.dirty = true;
@@ -1246,7 +1271,7 @@ impl<M: VfsFile, W: VfsFile> Pin<'_, M, W> {
     /// ```
     #[must_use]
     pub fn page_id(&self) -> PageId {
-        self.pager.state.borrow().meta[self.index].page_id
+        self.pager.state.lock().expect("pager").meta[self.index].page_id
     }
 
     /// LSN of the cached image.
@@ -1292,13 +1317,13 @@ impl<M: VfsFile, W: VfsFile> Pin<'_, M, W> {
     /// ```
     #[must_use]
     pub fn lsn(&self) -> Lsn {
-        self.pager.state.borrow().meta[self.index].lsn
+        self.pager.state.lock().expect("pager").meta[self.index].lsn
     }
 }
 
 impl<M: VfsFile, W: VfsFile> Drop for Pin<'_, M, W> {
     fn drop(&mut self) {
-        let mut state = self.pager.state.borrow_mut();
+        let mut state = self.pager.state.lock().expect("pager");
         let frame = &mut state.meta[self.index];
         debug_assert!(frame.pin_count > 0);
         frame.pin_count = frame.pin_count.saturating_sub(1);
@@ -1351,14 +1376,14 @@ impl<M: VfsFile, W: VfsFile> Drop for Pin<'_, M, W> {
 /// ```
 #[must_use = "the guard borrows the pinned image"]
 pub struct Bytes<'a> {
-    inner: Ref<'a, [u8]>,
+    inner: MutexGuard<'a, [u8; PAGE_SIZE]>,
 }
 
 impl Deref for Bytes<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        &self.inner[..]
     }
 }
 
@@ -1444,7 +1469,8 @@ impl<M: VfsFile, W: VfsFile> Drop for SnapshotGuard<'_, M, W> {
     fn drop(&mut self) {
         self.pager
             .state
-            .borrow_mut()
+            .lock()
+            .expect("pager")
             .snapshots
             .retain(|(id, _)| *id != self.id);
     }
@@ -1454,11 +1480,13 @@ struct State<M: VfsFile, W: VfsFile> {
     main: M,
     wal: Wal<W>,
     meta: Vec<FrameMeta>,
+    by_page: HashMap<PageId, Vec<usize>>,
     clock_hand: usize,
     snapshots: Vec<(u64, Lsn)>,
     next_snapshot_id: u64,
     next_txn_id: u64,
     committed_lsn: Lsn,
+    recovered_frames: u64,
     stats: PagerStats,
 }
 
@@ -1471,8 +1499,10 @@ impl<M: VfsFile, W: VfsFile> State<M, W> {
 
     fn find_cached(&self, page_id: PageId, snapshot: Lsn) -> Option<usize> {
         let floor = self.newest_wal_lsn(page_id, snapshot);
+        let slots = self.by_page.get(&page_id)?;
         let mut best: Option<(usize, Lsn)> = None;
-        for (index, frame) in self.meta.iter().enumerate() {
+        for &index in slots {
+            let frame = &self.meta[index];
             if !frame.occupied || frame.dirty || frame.page_id != page_id || frame.lsn > snapshot {
                 continue;
             }
@@ -1497,30 +1527,15 @@ impl<M: VfsFile, W: VfsFile> State<M, W> {
     }
 
     fn newest_wal_lsn(&self, page_id: PageId, snapshot: Lsn) -> Option<Lsn> {
-        self.wal
-            .pages()
-            .iter()
-            .filter(|page| page.page_id() == page_id && page.lsn() <= snapshot)
-            .map(CommittedPage::lsn)
-            .max()
+        self.wal.newest_lsn(page_id, snapshot)
     }
 
     fn wal_image(
-        &self,
+        &mut self,
         page_id: PageId,
         snapshot: Lsn,
     ) -> Result<Option<[u8; PAGE_SIZE]>, PagerError> {
-        let Some(page) = self
-            .wal
-            .pages()
-            .iter()
-            .filter(|page| page.page_id() == page_id && page.lsn() <= snapshot)
-            .max_by_key(|page| page.lsn())
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(copy_page(page.image())?))
+        Ok(self.wal.read_visible(page_id, snapshot)?)
     }
 
     fn load_image(&mut self, page_id: PageId, snapshot: Lsn) -> Result<Loaded, PagerError> {
@@ -1627,15 +1642,16 @@ struct Loaded {
 
 fn install<M: VfsFile, W: VfsFile>(
     state: &mut State<M, W>,
-    frames: &[RefCell<[u8; PAGE_SIZE]>],
+    frames: &[Mutex<[u8; PAGE_SIZE]>],
     index: usize,
     loaded: &Loaded,
 ) {
     if state.meta[index].occupied {
         bump(&mut state.stats.evictions);
+        forget_frame(state, index);
     }
 
-    *frames[index].borrow_mut() = loaded.bytes;
+    *frames[index].lock().expect("pager") = loaded.bytes;
     state.meta[index] = FrameMeta {
         page_id: loaded.header.page_id(),
         lsn: loaded.header.lsn(),
@@ -1646,6 +1662,32 @@ fn install<M: VfsFile, W: VfsFile>(
         durable_main: loaded.durable_main,
         durable_wal: loaded.durable_wal,
     };
+    remember_frame(state, index);
+}
+
+fn forget_frame<M: VfsFile, W: VfsFile>(state: &mut State<M, W>, index: usize) {
+    if !state.meta[index].occupied {
+        return;
+    }
+    let page_id = state.meta[index].page_id;
+    let Some(slots) = state.by_page.get_mut(&page_id) else {
+        return;
+    };
+    slots.retain(|slot| *slot != index);
+    if slots.is_empty() {
+        state.by_page.remove(&page_id);
+    }
+}
+
+fn remember_frame<M: VfsFile, W: VfsFile>(state: &mut State<M, W>, index: usize) {
+    if !state.meta[index].occupied {
+        return;
+    }
+    let page_id = state.meta[index].page_id;
+    let slots = state.by_page.entry(page_id).or_default();
+    if !slots.contains(&index) {
+        slots.push(index);
+    }
 }
 
 fn note_hit<M: VfsFile, W: VfsFile>(
@@ -1682,7 +1724,11 @@ fn page_offset(page_id: PageId) -> Result<u64, PagerError> {
 fn decode_page(bytes: &[u8], page_id: PageId) -> Result<PageHeader, PagerError> {
     let header = match PageHeader::decode(bytes) {
         Ok(header) => header,
-        Err(CodecError::ChecksumMismatch) => return Err(PagerError::ChecksumMismatch),
+        Err(CodecError::ChecksumMismatch) => {
+            return Err(PagerError::ChecksumMismatch {
+                page_id: page_id.as_u64(),
+            });
+        }
         Err(_) => return Err(PagerError::Corrupt),
     };
 
@@ -1699,9 +1745,10 @@ fn copy_page(bytes: &[u8]) -> Result<[u8; PAGE_SIZE], PagerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::Mutex;
 
     use super::{Pager, PagerError};
     use crate::page::{HEADER_SIZE, Lsn, PAGE_SIZE, PageHeader, PageId, PageKind};
@@ -1716,7 +1763,7 @@ mod tests {
         bytes: Vec<u8>,
     }
 
-    type WriteLog = Rc<RefCell<Vec<RecordedWrite>>>;
+    type WriteLog = Rc<Mutex<Vec<RecordedWrite>>>;
 
     struct Controls {
         fail_reads: Rc<Cell<u32>>,
@@ -1735,7 +1782,7 @@ mod tests {
         fn new(inner: F) -> (Self, Controls) {
             let fail_reads = Rc::new(Cell::new(0));
             let fail_syncs = Rc::new(Cell::new(0));
-            let writes = Rc::new(RefCell::new(Vec::new()));
+            let writes = Rc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     inner,
@@ -1764,7 +1811,7 @@ mod tests {
 
         fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
             let written = self.inner.write_at(offset, data)?;
-            self.writes.borrow_mut().push(RecordedWrite {
+            self.writes.lock().expect("pager").push(RecordedWrite {
                 offset,
                 bytes: data[..written].to_vec(),
             });
@@ -2090,11 +2137,11 @@ mod tests {
 
         assert!(matches!(
             pager.pin(PageId::new(0), lsn),
-            Err(PagerError::ChecksumMismatch)
+            Err(PagerError::ChecksumMismatch { page_id: 0 })
         ));
         assert!(matches!(
             pager.pin(PageId::new(0), lsn),
-            Err(PagerError::ChecksumMismatch)
+            Err(PagerError::ChecksumMismatch { page_id: 0 })
         ));
         assert_eq!(pager.stats().read_io(), 0);
         assert_eq!(pager.stats().misses(), 0);
@@ -2141,8 +2188,8 @@ mod tests {
         pager.write_main(&pin).expect("write main");
 
         assert_eq!(pager.stats().write_io(), 1);
-        let recorded = controls.writes.borrow()[0].bytes.clone();
-        assert_eq!(controls.writes.borrow()[0].offset, 0);
+        let recorded = controls.writes.lock().expect("pager")[0].bytes.clone();
+        assert_eq!(controls.writes.lock().expect("pager")[0].offset, 0);
         assert_eq!(recorded.as_slice(), &pin.bytes()[..]);
         pin.mark_dirty();
         drop(pin);

@@ -56,6 +56,9 @@ use crate::error::{GraphError, corrupt};
 /// # Ok(())
 /// # }
 /// ```
+/// One stored key and its value.
+pub type KeyValue = (Vec<u8>, Vec<u8>);
+
 pub trait KeyRead {
     /// Ordered scan returned by [`Self::scan`].
     type Scan<'a>: Iterator<Item = Result<(Vec<u8>, Vec<u8>), StorageError>>
@@ -76,6 +79,23 @@ pub trait KeyRead {
     ///
     /// Returns the storage error of the underlying read.
     fn scan(&self, from: &[u8]) -> Result<Self::Scan<'_>, StorageError>;
+
+    /// Keys in `[start, end)`, in ascending order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage error of the underlying read.
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<KeyValue>, StorageError> {
+        let mut rows = Vec::new();
+        for item in self.scan(start)? {
+            let (key, value) = item?;
+            if key.as_slice() >= end {
+                break;
+            }
+            rows.push((key, value));
+        }
+        Ok(rows)
+    }
 }
 
 impl<'db, V: Vfs> KeyRead for ReadView<'db, V> {
