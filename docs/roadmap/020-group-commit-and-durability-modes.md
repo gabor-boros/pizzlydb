@@ -53,7 +53,7 @@ With one fsync per commit, throughput is capped at the device's sync rate (on th
 - [ ] Crash simulation: no commit acknowledged under `Full` or `Grouped` is ever lost. Under `Deferred`, loss is limited to commits newer than the last completed flusher sync, and the database is always consistent.
 - [ ] Benchmark: 64 concurrent committers on a real SSD reach at least 5x the single-sync-per-commit throughput, while p99 latency for `Full` stays within 2x the device sync latency.
 - [ ] A failed sync returns an error to every batch in the group, and no group member is acknowledged.
-- [ ] Rustdoc for `Durability` states the exact guarantee of each mode.
+- [x] Rustdoc for `Durability` states the exact guarantee of each mode.
 
 ## Testing and Validation
 

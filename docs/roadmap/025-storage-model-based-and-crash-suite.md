@@ -55,7 +55,7 @@ Each Phase 1A issue tests its own change, and this gate tests the interactions b
 - [ ] Crash enumeration covers every VFS operation index for histories of up to 50 operations, with 100 or more persistence subsets per point.
 - [ ] Zero acknowledged-commit losses, zero failures to reopen, and zero `verify_quick` failures across all runs.
 - [ ] A soak test shows bounded RSS and WAL size (graphs attached to the milestone report).
-- [ ] A milestone report in `docs/milestones/M1.md` summarizes the evidence.
+- [x] A milestone report in `docs/milestones/M1.md` summarizes the evidence.
 
 ## Testing and Validation
 

@@ -7,10 +7,11 @@ use std::iter::Peekable;
 use std::ops::Bound;
 
 use pizzlydb_storage::{
-    Lsn, MAX_KEY_LEN, MAX_VALUE_LEN, ReadView, Scan, Storage, StorageError, Vfs, WriteBatch,
+    Direction, Lsn, MAX_KEY_LEN, MAX_VALUE_LEN, ReadView, Scan, Storage, StorageError, Vfs,
+    WriteBatch,
 };
 
-use crate::access::KeyRead;
+use crate::access::{KeyRead, KeyValue};
 use crate::error::GraphError;
 
 type Staged = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
@@ -301,6 +302,61 @@ impl<'db, V: Vfs> KeyRead for GraphBatch<'db, V> {
             .peekable();
 
         Ok(BatchScan { base, staged })
+    }
+
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<KeyValue>, StorageError> {
+        let mut base = {
+            let mut rows = Vec::new();
+            for item in self
+                .base
+                .scan_range(Some(start), Some(end), Direction::Forward)?
+            {
+                rows.push(item?);
+            }
+            rows.into_iter().peekable()
+        };
+
+        let mut staged = self
+            .staged
+            .range::<[u8], _>((Bound::Included(start), Bound::Excluded(end)))
+            .peekable();
+        let mut rows = Vec::new();
+
+        loop {
+            let base_key = base.peek().map(|row| row.0.clone());
+            let staged_key = staged.peek().map(|(key, _)| (*key).clone());
+            match (base_key, staged_key) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    let Some(row) = base.next() else { break };
+                    rows.push(row);
+                }
+                (None, Some(_)) => {
+                    if let Some((key, Some(value))) = staged.next() {
+                        rows.push((key.clone(), value.clone()));
+                    }
+                }
+                (Some(base_key), Some(staged_key)) => match base_key.as_slice().cmp(&staged_key) {
+                    Ordering::Less => {
+                        let Some(row) = base.next() else { break };
+                        rows.push(row);
+                    }
+                    Ordering::Greater => {
+                        if let Some((key, Some(value))) = staged.next() {
+                            rows.push((key.clone(), value.clone()));
+                        }
+                    }
+                    Ordering::Equal => {
+                        base.next();
+                        if let Some((key, Some(value))) = staged.next() {
+                            rows.push((key.clone(), value.clone()));
+                        }
+                    }
+                },
+            }
+        }
+
+        Ok(rows)
     }
 }
 

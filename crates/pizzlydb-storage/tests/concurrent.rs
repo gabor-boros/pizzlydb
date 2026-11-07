@@ -1,10 +1,19 @@
 //! Readers share a database with one writer.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use pizzlydb_storage::{Durability, MemoryVfs, Storage};
+
+fn commits() -> u64 {
+    std::env::var("PIZZLYDB_STRESS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(256)
+}
 
 #[test]
 fn readers_see_committed_batches() {
@@ -15,9 +24,10 @@ fn readers_see_committed_batches() {
         })
         .unwrap(),
     );
-    let barrier = Arc::new(Barrier::new(5));
+    let readers_n = 16;
+    let barrier = Arc::new(Barrier::new(readers_n + 2));
     let mut readers = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..readers_n {
         let db = Arc::clone(&db);
         let barrier = Arc::clone(&barrier);
         readers.push(thread::spawn(move || {
@@ -37,25 +47,41 @@ fn readers_see_committed_batches() {
             }
         }));
     }
+    let done = Arc::new(AtomicBool::new(false));
     let writer = {
         let db = Arc::clone(&db);
         let barrier = Arc::clone(&barrier);
+        let count = commits();
         thread::spawn(move || {
             barrier.wait();
-            for index in 0..100u64 {
+            for index in 0..count {
                 let mut batch = db.begin_write().expect("batch");
                 batch.put(b"k", &index.to_be_bytes()).expect("put");
                 batch.commit(Durability::Full).expect("commit");
             }
         })
     };
+    let checkpoint = {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            barrier.wait();
+            while !done.load(Ordering::Relaxed) {
+                let _ = db.checkpoint();
+            }
+        })
+    };
     writer.join().expect("writer");
+    done.store(true, Ordering::Relaxed);
+    checkpoint.join().expect("checkpoint");
     for reader in readers {
         reader.join().expect("reader");
     }
     let view = db.snapshot().unwrap();
+    let last = commits() - 1;
     assert_eq!(
         view.get(b"k").unwrap().as_deref(),
-        Some(99u64.to_be_bytes().as_slice())
+        Some(last.to_be_bytes().as_slice())
     );
 }

@@ -61,11 +61,11 @@ Every layer above storage would otherwise have to funnel through one thread, whi
 
 ## Acceptance Criteria
 
-- [ ] `static_assertions::assert_impl_all!(Storage<PosixVfs>: Send, Sync)`, and the same for `ReadView`.
+- [x] `static_assertions::assert_impl_all!(Storage<PosixVfs>: Send, Sync)`, and the same for `ReadView`.
 - [ ] Stress test: 16 reader threads that verify snapshot invariants (every key set at commit N is visible in full, or not at all) while one writer commits 100,000 batches and a third thread checkpoints. The test finds no violations, panics, or deadlocks.
 - [ ] Model checking with `loom` (or `shuttle`) of the snapshot registry, the pin and evict protocol, and the publish and reclaim protocol, at small bounds.
 - [ ] Single-thread throughput does not regress by more than 10% against the [005](005-benchmark-harness-and-baselines.md) baseline, and read throughput scales at least 6x from 1 to 8 threads on an 8-core machine.
-- [ ] The ADR is merged and still holds: there is still no `unsafe`.
+- [x] The ADR is merged and still holds: there is still no `unsafe`.
 
 ## Testing and Validation
 

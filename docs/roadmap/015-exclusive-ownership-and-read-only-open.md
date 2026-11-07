@@ -48,10 +48,10 @@ Two read-write openers corrupt the WAL. Today `backup`, `verify_quick`, and `sal
 
 ## Acceptance Criteria
 
-- [ ] Opening the same path twice read-write (in the same process, and from a child process) fails with `Locked`.
-- [ ] `open_read_only` on a database with an unsynced WAL tail leaves both files byte-identical (checked by a hash before and after).
-- [ ] `verify_quick`, `backup`, and `salvage` succeed on a file with mode `0444`.
-- [ ] The lock is released after `close()`, `drop`, and process exit (multi-process test).
+- [x] Opening the same path twice read-write (in the same process, and from a child process) fails with `Locked`.
+- [x] `open_read_only` on a database with an unsynced WAL tail leaves both files byte-identical (checked by a hash before and after).
+- [x] `verify_quick`, `backup`, and `salvage` succeed on a file with mode `0444`.
+- [x] The lock is released after `close()`, `drop`, and process exit (multi-process test).
 
 ## Testing and Validation
 

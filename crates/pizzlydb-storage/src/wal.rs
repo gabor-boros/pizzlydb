@@ -196,10 +196,13 @@ impl From<VfsError> for WalError {
 /// Sync requested for one commit.
 ///
 /// [`Self::Full`] syncs this commit before it is acknowledged.
-/// [`Self::Grouped`] has the same guarantee; a lone committer syncs immediately
-/// because there is no second batch to wait for.
+/// [`Self::Grouped`] writes the commit, makes it visible to the next batch, and
+/// acknowledges only after a shared sync. A lone committer with `max_delay` of
+/// zero syncs immediately. A failed group sync closes the handle and discards
+/// the unsynced tail, so no waiter is acknowledged.
 /// [`Self::Deferred`] acknowledges after the frames are written and bounds the
-/// loss window by [`Storage::sync`](crate::Storage::sync) or a later flusher.
+/// loss window by [`Storage::sync`](crate::Storage::sync) or a later synced
+/// commit. A crash before that sync can drop the commit.
 /// [`Self::None`] records the commit and does not sync. It is the test mode
 /// with no flusher.
 ///
@@ -717,16 +720,33 @@ impl<F: VfsFile> Wal<F> {
         self.write_frame(KIND_COMMIT, &payload)?;
 
         match durability {
-            Durability::Full | Durability::Grouped { .. } => {
+            Durability::Full => {
                 if let Err(err) = self.sync() {
                     self.discard_unsynced();
                     return Err(err);
                 }
             }
-            Durability::None | Durability::Deferred { .. } => {}
+            Durability::Grouped { .. } | Durability::None | Durability::Deferred { .. } => {}
         }
 
         self.publish(txn_id, lsn);
+        Ok(())
+    }
+
+    /// Sync every commit record written since the previous successful sync.
+    ///
+    /// [`Durability::Grouped`] publishes the index before this sync so a later
+    /// batch in the group can read it. Acknowledgement waits for this call.
+    /// On failure the unsynced tail is discarded and nothing new is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] when the sync fails.
+    pub(crate) fn sync_durable(&mut self) -> Result<(), WalError> {
+        if let Err(err) = self.sync() {
+            self.discard_unsynced();
+            return Err(err);
+        }
         Ok(())
     }
 

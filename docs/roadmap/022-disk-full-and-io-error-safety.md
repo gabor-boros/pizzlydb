@@ -54,10 +54,10 @@ Disk-full is one of the most common production incidents. Several paths in the c
 
 ## Acceptance Criteria
 
-- [ ] A fault matrix injects `NoSpace` into every write call site (WAL append, WAL header, main extend, main page write, superblock write) and every sync call site. After each injection, the next open succeeds, every acknowledged commit is present, and `verify_quick` passes.
+- [x] A fault matrix injects `NoSpace` into every write call site (WAL append, WAL header, main extend, main page write, superblock write) and every sync call site. After each injection, the next open succeeds, every acknowledged commit is present, and `verify_quick` passes.
 - [ ] Degraded mode: reads succeed and writes fail with `Full` until reopen (integration test).
 - [ ] A real-filesystem test on a small loop or tmpfs mount with a size limit passes in a Linux CI job (nightly).
-- [ ] A runbook entry describes recovery from disk-full ([221](221-documentation-set.md) collects it).
+- [x] A runbook entry describes recovery from disk-full ([221](221-documentation-set.md) collects it).
 
 ## Testing and Validation
 

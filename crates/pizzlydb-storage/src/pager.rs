@@ -892,6 +892,46 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
         Ok(())
     }
 
+    /// Sync the log. On failure, discard the unsynced tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Wal`] when the sync fails. The caller closes the
+    /// handle; the in-memory index is not rolled back.
+    pub(crate) fn sync_group(&self) -> Result<(), PagerError> {
+        self.state.lock().expect("pager").wal.sync_durable()?;
+        Ok(())
+    }
+
+    /// Drop log bytes written after the last successful sync.
+    pub(crate) fn discard_wal_tail(&self) {
+        self.state.lock().expect("pager").wal.abandon_unsynced();
+    }
+
+    /// Sum of frame pin counts. Tests use this to catch a leaked pin.
+    #[must_use]
+    pub(crate) fn pinned_frames(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("pager")
+            .meta
+            .iter()
+            .map(|frame| frame.pin_count)
+            .sum()
+    }
+}
+
+impl<M: VfsFile, W: VfsFile> Drop for Pager<M, W> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            let pins = self.pinned_frames();
+            assert_eq!(pins, 0, "pager dropped with pins still held");
+        }
+    }
+}
+
+impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// Write `image` to the main file at `page_id` and drop an unpinned cache frame.
     ///
     /// This does not sync the file and does not append a log record.

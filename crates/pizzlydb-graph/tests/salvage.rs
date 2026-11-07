@@ -654,3 +654,32 @@ fn salvage_reports_an_omitted_namespace_and_a_fresh_identity() {
     );
     assert!(matches!(missing, Err(GraphError::NotFound)));
 }
+
+#[cfg(unix)]
+#[test]
+fn salvage_reads_a_mode_0444_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use pizzlydb_storage::{PosixVfs, wal_path};
+
+    let dir = std::env::temp_dir().join(format!("pizzly-salvage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let vfs = PosixVfs::new();
+    let source = dir.join("src");
+    let destination = dir.join("dst");
+    let db = Storage::create(&vfs, &source, 8, Durability::Full, |id| id.fill(3)).unwrap();
+    drop(db);
+    for file in [&source, &wal_path(&source)] {
+        let mut permissions = std::fs::metadata(file).unwrap().permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(file, permissions).unwrap();
+    }
+    let report = salvage(
+        &vfs,
+        &source,
+        &destination,
+        NamespaceId::from_u128(1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report.nodes, 0);
+}

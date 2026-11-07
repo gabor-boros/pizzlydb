@@ -141,3 +141,49 @@ impl VfsFile for FullFile {
         self.role
     }
 }
+
+#[test]
+fn read_only_open_leaves_an_unsynced_log_byte_identical() {
+    use pizzlydb_storage::wal_path;
+
+    let vfs = MemoryVfs::new();
+    let path = Path::new("hash");
+    let db = Storage::create(&vfs, path, 4, Durability::None, |id| id.fill(5)).unwrap();
+    let mut batch = db.begin_write().unwrap();
+    batch.put(b"k", b"v").unwrap();
+    batch.commit(Durability::None).unwrap();
+    drop(db);
+    let before = (
+        file_bytes(&vfs, path, FileRole::Main),
+        file_bytes(&vfs, &wal_path(path), FileRole::Wal),
+    );
+    let db = Storage::open_read_only(&vfs, path, 4, Durability::None).unwrap();
+    assert_eq!(
+        db.snapshot().unwrap().get(b"k").unwrap().as_deref(),
+        Some(&b"v"[..])
+    );
+    drop(db);
+    assert_eq!(before.0, file_bytes(&vfs, path, FileRole::Main));
+    assert_eq!(before.1, file_bytes(&vfs, &wal_path(path), FileRole::Wal));
+}
+
+#[test]
+fn close_releases_the_lock_while_the_value_is_still_in_scope() {
+    let vfs = MemoryVfs::new();
+    let path = Path::new("closed");
+    let db = Storage::create(&vfs, path, 4, Durability::Full, |id| id.fill(6)).unwrap();
+    db.close().unwrap();
+    let reopened = Storage::open(&vfs, path, 4, Durability::Full);
+    assert!(reopened.is_ok());
+    assert!(matches!(db.snapshot(), Err(StorageError::Closed)));
+}
+
+fn file_bytes(vfs: &MemoryVfs, path: &Path, role: FileRole) -> Vec<u8> {
+    let mut file = vfs.open(path, role, &OpenOptions::new()).unwrap();
+    let len = usize::try_from(file.len().unwrap()).unwrap();
+    let mut buf = vec![0; len];
+    if len > 0 {
+        file.read_exact(0, &mut buf).unwrap();
+    }
+    buf
+}

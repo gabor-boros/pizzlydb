@@ -48,10 +48,10 @@ Extend the key-value API with the range primitives that the transaction, graph, 
 
 ## Acceptance Criteria
 
-- [ ] Model-based tests against a `BTreeMap` reference cover forward and reverse bounded scans over snapshots and over write batches with staged writes and range tombstones.
+- [x] Model-based tests against a `BTreeMap` reference cover forward and reverse bounded scans over snapshots and over write batches with staged writes and range tombstones.
 - [ ] `delete_range` over 1,000,000 keys commits in at most a documented number of pages written, and the freed pages are reclaimed (test plus benchmark).
-- [ ] The documented error bounds of `estimate_range` hold on uniform and skewed datasets (test).
-- [ ] The graph `KeyRead` exposes bounded scans, and existing graph callers migrate to them.
+- [x] The documented error bounds of `estimate_range` hold on uniform and skewed datasets (test).
+- [x] The graph `KeyRead` exposes bounded scans, and existing graph callers migrate to them.
 
 ## Testing and Validation
 

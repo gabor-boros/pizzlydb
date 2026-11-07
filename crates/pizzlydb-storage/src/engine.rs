@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -333,13 +333,22 @@ struct Inner<V: Vfs> {
     db: Mutex<DbState>,
     durability: Durability,
     limits: Mutex<BatchLimits>,
-    /// Released when the last handle drops. The field is read by [`Drop`].
-    #[allow(dead_code)]
-    lock: FileLock,
+    /// Replaced with a no-op guard by [`Storage::close`]. Drop releases whatever remains.
+    lock: Mutex<FileLock>,
     policy: Mutex<Option<CheckpointPolicy>>,
+    /// Page ids already copied by a budgeted checkpoint that has not sealed a superblock.
+    checkpoint_copied: Mutex<Vec<PageId>>,
     gate: Mutex<()>,
+    sync_group: Mutex<SyncGroup>,
+    sync_cv: Condvar,
     checker: Mutex<Option<JoinHandle<()>>>,
     shutdown: AtomicBool,
+}
+
+struct SyncGroup {
+    flushing: bool,
+    epoch: u64,
+    failed: bool,
 }
 
 struct DbState {
@@ -409,7 +418,7 @@ impl<V: Vfs> Storage<V> {
         let pager = Pager::open(main, wal, frame_count).map_err(map_pager)?;
         vfs.sync_dir(parent_dir(path))?;
 
-        Ok(Self {
+        let storage = Self {
             inner: Arc::new(Inner {
                 pager,
                 db: Mutex::new(DbState {
@@ -424,13 +433,21 @@ impl<V: Vfs> Storage<V> {
                 }),
                 durability,
                 limits: Mutex::new(BatchLimits::default()),
-                lock,
+                lock: Mutex::new(lock),
                 policy: Mutex::new(None),
+                checkpoint_copied: Mutex::new(Vec::new()),
                 gate: Mutex::new(()),
+                sync_group: Mutex::new(SyncGroup {
+                    flushing: false,
+                    epoch: 0,
+                    failed: false,
+                }),
+                sync_cv: Condvar::new(),
                 checker: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
             }),
-        })
+        };
+        Ok(storage)
     }
 
     /// Open a database created by [`Self::create`].
@@ -547,7 +564,7 @@ impl<V: Vfs> Storage<V> {
         pager.recover_floor(checkpoint).map_err(map_pager)?;
         let (root, space) = load_catalog(&pager)?;
 
-        Ok(Self {
+        let storage = Self {
             inner: Arc::new(Inner {
                 pager,
                 db: Mutex::new(DbState {
@@ -562,13 +579,21 @@ impl<V: Vfs> Storage<V> {
                 }),
                 durability,
                 limits: Mutex::new(BatchLimits::default()),
-                lock,
+                lock: Mutex::new(lock),
                 policy: Mutex::new(None),
+                checkpoint_copied: Mutex::new(Vec::new()),
                 gate: Mutex::new(()),
+                sync_group: Mutex::new(SyncGroup {
+                    flushing: false,
+                    epoch: 0,
+                    failed: false,
+                }),
+                sync_cv: Condvar::new(),
                 checker: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
             }),
-        })
+        };
+        Ok(storage)
     }
 
     /// Register the current committed sequence.
@@ -742,6 +767,10 @@ impl<V: Vfs> Storage<V> {
     /// db.checkpoint().unwrap();
     /// ```
     pub fn checkpoint(&self) -> Result<(), StorageError> {
+        self.checkpoint_limited(None)
+    }
+
+    fn checkpoint_limited(&self, budget: Option<u32>) -> Result<(), StorageError> {
         let _gate = self.inner.gate.lock().expect("storage");
         {
             let db = self.inner.db.lock().expect("storage");
@@ -769,13 +798,43 @@ impl<V: Vfs> Storage<V> {
         let state = read_page(&self.inner.pager, visible, STATE_PAGE_ID)?;
         let (root, high_water) = decode_state(&state)?;
 
-        for id in self.inner.pager.wal_page_ids(visible) {
-            if id.as_u64() < 2 {
-                continue;
-            }
+        let pending: Vec<PageId> = {
+            let copied = self.inner.checkpoint_copied.lock().expect("storage");
+            self.inner
+                .pager
+                .wal_page_ids(visible)
+                .into_iter()
+                .filter(|id| id.as_u64() >= 2 && !copied.contains(id))
+                .collect()
+        };
+        let limit = budget.map_or(pending.len(), |count| count as usize);
+        for id in pending.into_iter().take(limit) {
             let pin = self.inner.pager.pin(id, visible).map_err(map_pager)?;
             self.inner.pager.write_main(&pin).map_err(map_pager)?;
+            self.inner
+                .checkpoint_copied
+                .lock()
+                .expect("storage")
+                .push(id);
         }
+        let finished = {
+            let copied = self.inner.checkpoint_copied.lock().expect("storage");
+            self.inner
+                .pager
+                .wal_page_ids(visible)
+                .into_iter()
+                .filter(|id| id.as_u64() >= 2)
+                .all(|id| copied.contains(&id))
+        };
+        if !finished {
+            return Ok(());
+        }
+        self.inner
+            .checkpoint_copied
+            .lock()
+            .expect("storage")
+            .clear();
+
         if reclaimed && visible == committed {
             self.write_reclaimed_space(visible)?;
         }
@@ -868,6 +927,8 @@ impl<V: Vfs> Storage<V> {
         self.inner.shutdown.store(true, Ordering::Relaxed);
         let mut db = self.inner.db.lock().expect("storage");
         db.closed = true;
+        drop(db);
+        *self.inner.lock.lock().expect("storage") = FileLock::noop();
         Ok(())
     }
 
@@ -896,7 +957,8 @@ impl<V: Vfs> Storage<V> {
 
         let appended = self.inner.pager.wal_appended_bytes().map_err(map_pager)?;
         if appended >= policy.wal_soft_bytes {
-            self.checkpoint()?;
+            let budget = (policy.page_budget > 0).then_some(policy.page_budget);
+            self.checkpoint_limited(budget)?;
         }
 
         Ok(())
@@ -1365,8 +1427,9 @@ impl<'a, V: Vfs> ReadView<'a, V> {
 
     /// Exact key count and byte size of `[start, end)`.
     ///
-    /// The lower and upper key bounds are equal. Bytes count stored key and
-    /// value lengths, not page images.
+    /// The estimate is exact: the lower and upper key bounds are equal. Bytes
+    /// count stored key and value lengths, not page images. Uniform and skewed
+    /// key sets use the same count.
     ///
     /// # Errors
     ///
@@ -1618,8 +1681,10 @@ impl<V: Vfs> WriteBatch<V> {
 
     /// Stage removal of every committed or staged key in `[start, end)`.
     ///
-    /// The deletion is applied on commit as one key at a time. A range that
-    /// covers a whole subtree still rewrites the pages that hold those keys.
+    /// The deletion is applied on commit as one key at a time. Pages written are
+    /// proportional to the number of keys in the range, not to the database size.
+    /// A range that covers a whole subtree still rewrites the pages that hold
+    /// those keys.
     ///
     /// # Errors
     ///
@@ -1749,8 +1814,40 @@ impl<V: Vfs> WriteBatch<V> {
         }
     }
 
+    fn join_group(&self, max_delay: Duration) -> Result<(), StorageError> {
+        let mut group = self.inner.sync_group.lock().expect("storage");
+        if group.flushing {
+            let epoch = group.epoch;
+            while group.epoch == epoch {
+                group = self.inner.sync_cv.wait(group).expect("storage");
+            }
+            return if group.failed {
+                Err(StorageError::Io(io_error("group sync failed")))
+            } else {
+                Ok(())
+            };
+        }
+
+        group.flushing = true;
+        drop(group);
+        if !max_delay.is_zero() {
+            thread::sleep(max_delay);
+        }
+        let result = self.inner.pager.sync_group().map_err(map_pager);
+        if result.is_err() {
+            self.inner.pager.discard_wal_tail();
+            self.inner.db.lock().expect("storage").closed = true;
+        }
+        let mut group = self.inner.sync_group.lock().expect("storage");
+        group.flushing = false;
+        group.failed = result.is_err();
+        group.epoch = group.epoch.wrapping_add(1);
+        self.inner.sync_cv.notify_all();
+        result
+    }
+
     fn publish(&mut self, durability: Durability) -> Result<Lsn, StorageError> {
-        let _gate = self.inner.gate.lock().expect("storage");
+        let gate = self.inner.gate.lock().expect("storage");
         self.ensure_open()?;
         if self.stage.is_empty() {
             return Ok(self.inner.pager.committed_lsn());
@@ -1810,9 +1907,20 @@ impl<V: Vfs> WriteBatch<V> {
 
         match self.inner.pager.commit_pages(&images, durability) {
             Ok(lsn) => {
-                let mut db = self.inner.db.lock().expect("storage");
-                db.root = new_root;
-                db.space = new_space;
+                let grouped = matches!(durability, Durability::Grouped { .. });
+                {
+                    let mut db = self.inner.db.lock().expect("storage");
+                    db.root = new_root;
+                    db.space = new_space;
+                    if grouped {
+                        db.writer = false;
+                    }
+                }
+                if let Durability::Grouped { max_delay } = durability {
+                    self.committed = true;
+                    drop(gate);
+                    self.join_group(max_delay)?;
+                }
                 Ok(lsn)
             }
             Err(err) => {
@@ -2289,7 +2397,7 @@ fn checker_loop<V: Vfs>(weak: Weak<Inner<V>>) {
                 let storage = Storage {
                     inner: Arc::clone(&inner),
                 };
-                let _ = storage.checkpoint();
+                let _ = storage.poll_checkpoint();
             }
         }
         drop(inner);
@@ -2385,5 +2493,146 @@ mod tests {
         }
         assert!(db.reuse_candidate(&retired).is_some());
         assert!(db.snapshot().unwrap().get(b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_held_snapshot_hits_the_wal_hard_limit() {
+        use super::Storage;
+        use crate::vfs_memory::MemoryVfs;
+        use crate::{CheckpointPolicy, Durability, StorageError};
+        use std::time::Duration;
+
+        let vfs = MemoryVfs::new();
+        let db = Storage::create(&vfs, Path::new("hard"), 8, Durability::Full, |id| {
+            id.fill(2);
+        })
+        .unwrap();
+        let mut batch = db.begin_write().unwrap();
+        batch.put(b"k", b"v").unwrap();
+        batch.commit(Durability::Full).unwrap();
+        db.set_checkpoint_policy(CheckpointPolicy {
+            wal_soft_bytes: u64::MAX,
+            wal_hard_bytes: 1,
+            max_interval: Duration::from_secs(3600),
+            page_budget: 0,
+        });
+        let _view = db.snapshot().unwrap();
+        assert!(matches!(
+            db.begin_write(),
+            Err(StorageError::ResourceExhausted { resource: "wal" })
+        ));
+    }
+
+    #[test]
+    fn page_budget_seals_the_superblock_only_after_the_copy() {
+        use super::Storage;
+        use crate::vfs_memory::MemoryVfs;
+        use crate::{CheckpointPolicy, Durability};
+        use std::time::Duration;
+
+        let vfs = MemoryVfs::new();
+        let db = Storage::create(&vfs, Path::new("budget"), 8, Durability::Full, |id| {
+            id.fill(3);
+        })
+        .unwrap();
+        let mut batch = db.begin_write().unwrap();
+        for key in 0..8_u8 {
+            batch.put(&[key], &[key]).unwrap();
+        }
+        batch.commit(Durability::Full).unwrap();
+        let before = db.inner.pager.wal_appended_bytes().unwrap();
+        db.set_checkpoint_policy(CheckpointPolicy {
+            wal_soft_bytes: 1,
+            wal_hard_bytes: u64::MAX,
+            max_interval: Duration::from_secs(3600),
+            page_budget: 1,
+        });
+        db.poll_checkpoint().unwrap();
+        assert_eq!(db.inner.pager.wal_appended_bytes().unwrap(), before);
+        let mut sealed = false;
+        for _ in 0..64 {
+            db.poll_checkpoint().unwrap();
+            if db.inner.pager.wal_appended_bytes().unwrap() < before {
+                sealed = true;
+                break;
+            }
+        }
+        assert!(sealed, "budgeted checkpoint never sealed the superblock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sparse_file_covers_two_gibibytes_of_page_ids() {
+        use super::STATE_PAGE_ID;
+        use super::{fresh_superblock, offset_of};
+        use crate::page::PAGE_SIZE;
+        use crate::space::Space;
+        use crate::superblock::{COPY_A, COPY_B};
+        use crate::verify::verify_quick;
+        use crate::vfs::{FileRole, OpenOptions, Vfs, VfsFile};
+        use crate::vfs_posix::PosixVfs;
+        use crate::wal::Wal;
+
+        let mut space = Space::create();
+        let state_id = space.allocate(crate::page::PageKind::State).unwrap();
+        assert_eq!(state_id, STATE_PAGE_ID);
+        let pages = (2u64 * 1024 * 1024 * 1024) / u64::try_from(PAGE_SIZE).unwrap();
+        space.grow_to(pages).unwrap();
+        assert!(space.high_water() * u64::try_from(PAGE_SIZE).unwrap() >= 2 * 1024 * 1024 * 1024);
+        let encoded = space.encode();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide");
+        let vfs = PosixVfs::new();
+        let mut main = vfs
+            .open(
+                &path,
+                FileRole::Main,
+                &OpenOptions::new().create(true).exclusive(true),
+            )
+            .unwrap();
+        main.set_len(space.high_water() * u64::try_from(PAGE_SIZE).unwrap())
+            .unwrap();
+        let file_id = [4u8; 16];
+        let record = fresh_superblock(file_id, 1, space.high_water())
+            .unwrap()
+            .with_wal_generation(1);
+        let older = fresh_superblock(file_id, 0, space.high_water())
+            .unwrap()
+            .with_wal_generation(1);
+        main.write_all(0, &record.encode(COPY_A).unwrap()).unwrap();
+        main.write_all(
+            u64::try_from(PAGE_SIZE).unwrap(),
+            &older.encode(COPY_B).unwrap(),
+        )
+        .unwrap();
+        main.write_all(
+            offset_of(crate::page::ALLOCATOR_PAGE_ID).unwrap(),
+            &encoded.header,
+        )
+        .unwrap();
+        main.write_all(
+            offset_of(crate::page::BITMAP_PAGE_ID).unwrap(),
+            &encoded.bitmap,
+        )
+        .unwrap();
+        for extra in &encoded.extra_bitmaps {
+            main.write_all(offset_of(extra.page_id).unwrap(), &extra.bytes)
+                .unwrap();
+        }
+        let state = encode_state(PageId::new(0), space.high_water(), Lsn::new(0)).unwrap();
+        main.write_all(offset_of(STATE_PAGE_ID).unwrap(), &state)
+            .unwrap();
+        main.sync().unwrap();
+        drop(main);
+        let wal = vfs
+            .open(
+                &super::wal_path(&path),
+                FileRole::Wal,
+                &OpenOptions::new().create(true).exclusive(true),
+            )
+            .unwrap();
+        drop(Wal::create(wal, file_id).unwrap());
+        vfs.sync_dir(dir.path()).unwrap();
+        verify_quick(&vfs, &path).unwrap();
     }
 }

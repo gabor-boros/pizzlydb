@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::engine::{STATE_PAGE_ID, Storage, StorageError, decode_state};
 use crate::page::{PAGE_SIZE, PageHeader, PageId};
-use crate::vfs::Vfs;
+use crate::vfs::{Vfs, VfsError};
 
 /// Open `path` and check the committed snapshot.
 ///
@@ -60,7 +60,15 @@ pub fn verify_quick<V: Vfs>(vfs: &V, path: &Path) -> Result<(), StorageError> {
     let space = db.committed_space();
     for raw in 0..high_water {
         let id = PageId::new(raw);
-        let image = db.page_image(lsn, id)?;
+        let image = match db.page_image(lsn, id) {
+            Ok(image) => image,
+            // A grown high-water mark can name pages the main file does not
+            // store yet. Those pages are holes until a checkpoint extends it.
+            Err(StorageError::Io(VfsError::Truncated)) if !space.is_allocated(id) => continue,
+            Err(StorageError::Io(VfsError::Truncated)) => return Err(StorageError::Corrupt),
+            Err(err) => return Err(err),
+        };
+
         if image.iter().all(|byte| *byte == 0) {
             if space.is_allocated(id) {
                 return Err(StorageError::Corrupt);

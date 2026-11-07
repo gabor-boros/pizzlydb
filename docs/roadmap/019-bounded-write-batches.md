@@ -56,7 +56,7 @@ These operations write everything in a single batch, so their memory grows with 
 
 ## Acceptance Criteria
 
-- [ ] A test with `max_dirty_pages = 64` and a batch that needs 65 fails with `TransactionTooLarge`, after which the database remains usable and unchanged.
+- [x] A test with `max_dirty_pages = 64` and a batch that needs 65 fails with `TransactionTooLarge`, after which the database remains usable and unchanged.
 - [ ] Peak RSS during a maximum-size batch is within a documented factor of the configured limits (benchmark harness assertion).
 - [ ] The existing `create_index` path either respects the limit or is explicitly marked as superseded by [044](044-online-index-build-and-drop.md), with a test that documents the current failure.
 

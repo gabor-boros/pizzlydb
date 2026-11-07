@@ -48,7 +48,7 @@ The WAL holds a full copy of every page written since the last checkpoint. Becau
 - [ ] Opening a database with a 4 GiB WAL does not allocate O(WAL) memory.
 - [ ] Point-read latency does not grow linearly with WAL length (benchmark curve published).
 - [ ] All existing crash, snapshot, and checkpoint suites pass, plus the crash-simulation enumeration from [012](012-crash-safe-wal-reset.md).
-- [ ] The documentation states the memory formula for the index.
+- [x] The documentation states the memory formula for the index.
 
 ## Testing and Validation
 

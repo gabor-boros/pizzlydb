@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use pizzlydb_core::{ID_LEN, Identifier};
-use pizzlydb_storage::{ReadView, Scan, StorageError, Vfs};
+use pizzlydb_storage::{Direction, ReadView, Scan, StorageError, Vfs};
 
 use crate::error::{GraphError, corrupt};
 
@@ -111,25 +111,77 @@ impl<'db, V: Vfs> KeyRead for ReadView<'db, V> {
     fn scan(&self, from: &[u8]) -> Result<Self::Scan<'_>, StorageError> {
         ReadView::scan(self, Some(from))
     }
+
+    fn scan_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<KeyValue>, StorageError> {
+        let mut rows = Vec::new();
+        for item in ReadView::scan_range(self, Some(start), Some(end), Direction::Forward)? {
+            rows.push(item?);
+        }
+        Ok(rows)
+    }
 }
 
 /// Keys that start with one prefix, in key order.
 ///
-/// The scan reads one key past the last match to detect the end of the
-/// range, and does not yield it.
+/// The rows come from [`KeyRead::scan_range`]. The exclusive end is the
+/// prefix successor, so the read stops at the range instead of the next key
+/// outside it. A prefix of empty or all `0xff` bytes has no successor and
+/// falls back to [`KeyRead::scan`].
 pub(crate) struct PrefixScan<'r, R: KeyRead + 'r> {
-    inner: R::Scan<'r>,
+    rows: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
     prefix: Vec<u8>,
     done: bool,
+    _read: PhantomData<&'r R>,
+}
+
+fn exclusive_prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let mut end = prefix.to_vec();
+    while let Some(byte) = end.pop() {
+        if byte < u8::MAX {
+            end.push(byte + 1);
+            return Some(end);
+        }
+    }
+
+    None
+}
+
+fn collect_prefix<R: KeyRead + ?Sized>(
+    read: &R,
+    prefix: &[u8],
+    start: &[u8],
+) -> Result<Vec<KeyValue>, StorageError> {
+    let Some(end) = exclusive_prefix_end(prefix) else {
+        let mut rows = Vec::new();
+        for item in read.scan(start)? {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            rows.push((key, value));
+        }
+        return Ok(rows);
+    };
+
+    if start >= end.as_slice() {
+        return Ok(Vec::new());
+    }
+
+    read.scan_range(start, &end)
 }
 
 impl<'r, R: KeyRead + 'r> PrefixScan<'r, R> {
     pub(crate) fn new(read: &'r R, prefix: Vec<u8>) -> Result<Self, GraphError> {
-        let inner = read.scan(&prefix)?;
+        let rows = collect_prefix(read, &prefix, &prefix)?;
         Ok(Self {
-            inner,
+            rows: rows.into_iter(),
             prefix,
             done: false,
+            _read: PhantomData,
         })
     }
 
@@ -139,11 +191,12 @@ impl<'r, R: KeyRead + 'r> PrefixScan<'r, R> {
         prefix: Vec<u8>,
         start: &[u8],
     ) -> Result<Self, GraphError> {
-        let inner = read.scan(start)?;
+        let rows = collect_prefix(read, &prefix, start)?;
         Ok(Self {
-            inner,
+            rows: rows.into_iter(),
             prefix,
             done: false,
+            _read: PhantomData,
         })
     }
 
@@ -164,15 +217,11 @@ impl<'r, R: KeyRead + 'r> Iterator for PrefixScan<'r, R> {
             return None;
         }
 
-        match self.inner.next() {
-            Some(Ok((key, value))) if key.starts_with(&self.prefix) => Some(Ok((key, value))),
-            Some(Ok(_)) | None => {
+        match self.rows.next() {
+            Some((key, value)) if key.starts_with(&self.prefix) => Some(Ok((key, value))),
+            Some(_) | None => {
                 self.done = true;
                 None
-            }
-            Some(Err(err)) => {
-                self.done = true;
-                Some(Err(err.into()))
             }
         }
     }

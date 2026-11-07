@@ -71,14 +71,14 @@ The graph integration tests are `catalog_adjacency` (9), `indexes` (9), `propert
 
 | Component | Status | Evidence |
 | --- | --- | --- |
-| VFS (POSIX, in-memory, fault wrapper) | Implemented, incomplete | `storage/src/vfs*.rs`: no locking, `set_len`, preallocation, or data-only sync. The crash model is all-or-nothing. |
-| Pages and superblocks | Implemented | CRC-32C checksums, 8 KiB pages, dual superblocks, format 1.0. |
-| Page-image WAL | Implemented, unsafe prune | `wal.rs`: WAL v1 (`PZLW`). Every frame is held in memory, and `prune` rewrites frames in place. |
-| Pager | Implemented, single-threaded | `pager.rs`: CLOCK eviction with RAII pins, `RefCell` state, and linear-scan lookups. |
-| Allocator | Implemented, capped | `space.rs`: one bitmap page (`MAX_BITMAP_PAGES`), retire spill, and horizon reclaim in `maintain.rs`. |
-| B+ tree | Implemented | `btree.rs`: overflow values, parent pointers rewritten on every internal write, forward scans only, and 512-byte keys at most. |
-| Storage engine | Implemented, `!Send`/`!Sync` | `engine.rs`: atomic batches, physical snapshots, and manual checkpoint. `Space` is cloned on every commit. |
-| Backup, verify, inspect | Prototype | Offline only. These open the source read-write, and backup reuses the source's file identity. |
+| VFS (POSIX, in-memory, fault wrapper, crash simulation) | Implemented | `storage/src/vfs*.rs`: advisory `flock` or an in-process lock, `set_len`, best-effort `preallocate`, and `sync_data`. |
+| Pages and superblocks | Implemented | CRC-32C checksums, 8 KiB pages, dual superblocks, format 1.0, log generation, and feature flags. |
+| Page-image WAL | Implemented | `wal.rs`: WAL v2 (`PZLW`). The index stores offsets. Reset publishes a new generation and does not rewrite kept frames. |
+| Pager | Implemented, one writer | `pager.rs`: CLOCK eviction, mutex frames, and a page-id hash for cache lookup. |
+| Allocator | Implemented, chained bitmap | `space.rs`: bitmap pages chain through the last 8 bytes. `MAX_ADDRESSABLE_PAGES` is 2^32. `Space` is still cloned on commit. |
+| B+ tree | Implemented | `btree.rs`: overflow values, stored parent pointers, unchanged parents skipped, forward and reverse scans, and 512-byte keys at most. |
+| Storage engine | Implemented, `Send + Sync` | `engine.rs`: one batch, snapshots, exclusive or shared open, and an optional checkpoint policy. |
+| Backup, verify, inspect | Prototype | Offline. Verify, backup, and inspect take a shared lock and do not write the source. |
 | Ids, values, key encoding | Partial | `core/src/value.rs`: 128-bit ids and six value variants. The tag order puts every integer before every float. `sequence.rs` is empty. |
 | Records | Implemented | `record_store.rs`: create, update, and delete with `EndpointInUse`. Tombstones are permanent, and the id counter key is `0x01`. |
 | Catalog | Implemented | `catalog.rs`: interned names, rename, and byte-exact names of at most 256 bytes. |
@@ -106,7 +106,7 @@ None of these had been documented before. Each is now owned by an issue.
 | The in-memory crash model is all-or-nothing | Partial-writeback bugs, such as the prune defect, cannot be detected | `vfs_memory.rs` `crash` | [004](004-crash-consistency-simulation-vfs.md) |
 | Mixed integer and float values are ordered by type tag | Range scans over mixed numerics return wrong results (C4) | `core/src/value.rs` | [040](040-type-system-and-value-model.md) |
 | `PoolExhausted` is reported as an I/O error, and snapshot pin errors as corruption | Operators respond to the wrong failure | `engine.rs` `map_pager`, `SnapshotPages::pin` | [010](010-storage-error-taxonomy-fidelity.md) |
-| A single allocator bitmap page | The database cannot grow beyond about 510 MiB | `space.rs` `MAX_BITMAP_PAGES` | [014](014-scalable-space-allocator.md) |
+| Allocator clone | A bitmap that covered 2^32 pages is about 512 MiB and is copied with `Space` on commit | `engine.rs` `publish` clones `Space` | [014](014-scalable-space-allocator.md) |
 | Design gap: restore has no notion of incarnation | Clients that acknowledged positions after the backup point would skip data silently (R2) | No restore path exists | [108](108-backup-verification-and-restore.md) |
 
 ### 2.5 Guide work packages WP-01 to WP-12

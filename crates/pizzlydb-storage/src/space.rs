@@ -60,6 +60,7 @@
 //! The retire LSN is the body field.
 
 use std::mem;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -253,7 +254,9 @@ struct SpillPage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Space {
     high_water: u64,
-    bitmap: Vec<u8>,
+    /// One payload per bitmap page. [`Clone`] copies the [`Arc`]s. A bit write
+    /// copies only the chunk it changes.
+    chunks: Vec<Arc<Vec<u8>>>,
     extra_bitmap_pages: Vec<PageId>,
     page_limit: u64,
     retires: Vec<RetireEntry>,
@@ -283,7 +286,7 @@ impl Space {
     pub fn create() -> Self {
         let mut space = Self {
             high_water: INITIAL_PAGES,
-            bitmap: vec![0; BITMAP_PAYLOAD],
+            chunks: vec![Arc::new(vec![0; BITMAP_PAYLOAD])],
             extra_bitmap_pages: Vec::new(),
             page_limit: MAX_ADDRESSABLE_PAGES,
             retires: Vec::new(),
@@ -630,13 +633,9 @@ impl Space {
     #[must_use]
     pub fn encode(&self) -> EncodedSpace {
         assert_eq!(
-            self.bitmap.len() % BITMAP_PAYLOAD,
-            0,
-            "bitmap chunks are payload sized"
-        );
-        assert_eq!(
             self.extra_bitmap_pages.len() + 1,
-            self.bitmap.len() / BITMAP_PAYLOAD
+            self.chunks.len(),
+            "each bitmap page has one payload chunk"
         );
 
         assert!(
@@ -705,7 +704,7 @@ impl Space {
         let spill_pages = decode_spill_chain(decoded.spill_head, spills, decoded.high_water)?;
         let space = Self {
             high_water: decoded.high_water,
-            bitmap: bits,
+            chunks: chunk_payloads(&bits),
             extra_bitmap_pages: extra_pages,
             page_limit: MAX_ADDRESSABLE_PAGES,
             retires: decoded.retires,
@@ -866,6 +865,24 @@ impl Space {
         self.write_bit(id, false)
     }
 
+    /// Advance the high-water mark to at least `pages`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpaceError::Full`] when `pages` is past the page limit.
+    #[cfg(test)]
+    pub(crate) fn grow_to(&mut self, pages: u64) -> Result<(), SpaceError> {
+        if pages > self.page_limit {
+            self.page_limit = pages;
+        }
+
+        while self.high_water < pages {
+            self.grow()?;
+        }
+
+        Ok(())
+    }
+
     fn grow(&mut self) -> Result<(), SpaceError> {
         let next = self
             .high_water
@@ -911,33 +928,49 @@ impl Space {
         }
         let id_us = usize::try_from(id).map_err(|_| SpaceError::Corrupt)?;
         let chunks_needed = id_us / BITMAP_BITS + 1;
-        while self.bitmap.len() / BITMAP_PAYLOAD < chunks_needed {
-            self.bitmap.resize(self.bitmap.len() + BITMAP_PAYLOAD, 0);
-            let chunk = self.bitmap.len() / BITMAP_PAYLOAD - 1;
+        while self.chunks.len() < chunks_needed {
+            self.chunks.push(Arc::new(vec![0; BITMAP_PAYLOAD]));
+            let chunk = self.chunks.len() - 1;
             if chunk == 0 {
                 continue;
             }
             let page = (chunk as u64).saturating_mul(BITMAP_BITS as u64);
             self.extra_bitmap_pages.push(PageId::new(page));
-            let byte = usize::try_from(page / 8).map_err(|_| SpaceError::Corrupt)?;
-            let slot = self.bitmap.get_mut(byte).ok_or(SpaceError::Corrupt)?;
-            *slot |= 1;
+            self.write_bit_at(page, true)?;
         }
         Ok(())
     }
 
+    fn payload_len(&self) -> usize {
+        self.chunks.len().saturating_mul(BITMAP_PAYLOAD)
+    }
+
+    fn payload_byte(&self, index: usize) -> Option<u8> {
+        let chunk = index / BITMAP_PAYLOAD;
+        let offset = index % BITMAP_PAYLOAD;
+        self.chunks.get(chunk)?.get(offset).copied()
+    }
+
+    fn payload_byte_mut(&mut self, index: usize) -> Result<&mut u8, SpaceError> {
+        let chunk = index / BITMAP_PAYLOAD;
+        let offset = index % BITMAP_PAYLOAD;
+        let arc = self.chunks.get_mut(chunk).ok_or(SpaceError::Corrupt)?;
+        Arc::make_mut(arc)
+            .get_mut(offset)
+            .ok_or(SpaceError::Corrupt)
+    }
+
     fn bit(&self, id: u64) -> Result<bool, SpaceError> {
         let (byte, bit) = bit_index(id, self.page_limit)?;
-        let Some(slot) = self.bitmap.get(byte).copied() else {
+        let Some(slot) = self.payload_byte(byte) else {
             return Ok(false);
         };
         Ok((slot & (1u8 << bit)) != 0)
     }
 
-    fn write_bit(&mut self, id: u64, allocated: bool) -> Result<(), SpaceError> {
-        self.ensure_cover(id)?;
+    fn write_bit_at(&mut self, id: u64, allocated: bool) -> Result<(), SpaceError> {
         let (byte, bit) = bit_index(id, self.page_limit)?;
-        let slot = self.bitmap.get_mut(byte).ok_or(SpaceError::Corrupt)?;
+        let slot = self.payload_byte_mut(byte)?;
         let mask = 1u8 << bit;
 
         if allocated {
@@ -947,6 +980,11 @@ impl Space {
         }
 
         Ok(())
+    }
+
+    fn write_bit(&mut self, id: u64, allocated: bool) -> Result<(), SpaceError> {
+        self.ensure_cover(id)?;
+        self.write_bit_at(id, allocated)
     }
 
     fn encode_header(&self) -> [u8; PAGE_SIZE] {
@@ -983,16 +1021,16 @@ impl Space {
 
     fn encode_bitmap_page(&self, chunk: usize, page_id: PageId) -> [u8; PAGE_SIZE] {
         let mut page = [0u8; PAGE_SIZE];
-        let start = chunk * BITMAP_PAYLOAD;
-        let end = start + BITMAP_PAYLOAD;
-        page[HEADER_SIZE..HEADER_SIZE + BITMAP_PAYLOAD].copy_from_slice(&self.bitmap[start..end]);
-        let next = if chunk + 1 < self.bitmap.len() / BITMAP_PAYLOAD {
+        page[HEADER_SIZE..HEADER_SIZE + BITMAP_PAYLOAD].copy_from_slice(&self.chunks[chunk]);
+        let next = if chunk + 1 < self.chunks.len() {
             self.extra_bitmap_pages[chunk].as_u64()
         } else {
             0
         };
+
         write_u64(&mut page, PAGE_SIZE - BITMAP_LINK_LEN, next);
         seal_page(&mut page, PageKind::Bitmap, page_id);
+
         page
     }
 
@@ -1017,19 +1055,49 @@ impl Space {
             .collect()
     }
 
+    fn tail_is_clear(&self) -> Result<bool, SpaceError> {
+        let start = usize::try_from(self.high_water).map_err(|_| SpaceError::Corrupt)?;
+        let mut index = start / 8;
+        let len = self.payload_len();
+        if index >= len {
+            return Ok(true);
+        }
+
+        let bit = start % 8;
+        if bit != 0 {
+            let mask = u8::MAX << bit;
+            if self.payload_byte(index).unwrap_or(0) & mask != 0 {
+                return Ok(false);
+            }
+            index += 1;
+        }
+
+        while index < len {
+            if self.payload_byte(index).unwrap_or(0) != 0 {
+                return Ok(false);
+            }
+            index += 1;
+        }
+
+        Ok(true)
+    }
+
     fn validate_state(&self) -> Result<(), SpaceError> {
-        let chunks = self.bitmap.len() / BITMAP_PAYLOAD;
+        let chunks = self.chunks.len();
         let covered = (chunks as u64).saturating_mul(BITMAP_BITS as u64);
         if !valid_high_water(self.high_water, self.page_limit)
-            || !self.bitmap.len().is_multiple_of(BITMAP_PAYLOAD)
             || chunks == 0
+            || self
+                .chunks
+                .iter()
+                .any(|chunk| chunk.len() != BITMAP_PAYLOAD)
             || self.extra_bitmap_pages.len() + 1 != chunks
             || self.high_water > covered
         {
             return Err(SpaceError::Corrupt);
         }
 
-        if !tail_is_clear(&self.bitmap, self.high_water)? {
+        if !self.tail_is_clear()? {
             return Err(SpaceError::Corrupt);
         }
 
@@ -1346,23 +1414,21 @@ fn note_unique(seen: &mut Vec<PageId>, page_id: PageId) -> Result<(), SpaceError
     Ok(())
 }
 
-fn tail_is_clear(bitmap: &[u8], start: u64) -> Result<bool, SpaceError> {
-    let start = usize::try_from(start).map_err(|_| SpaceError::Corrupt)?;
-    let byte_index = start / 8;
-    if byte_index >= bitmap.len() {
-        return Ok(true);
+fn chunk_payloads(bits: &[u8]) -> Vec<Arc<Vec<u8>>> {
+    if bits.is_empty() {
+        return vec![Arc::new(vec![0; BITMAP_PAYLOAD])];
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < bits.len() {
+        let end = (offset + BITMAP_PAYLOAD).min(bits.len());
+        let mut chunk = vec![0u8; BITMAP_PAYLOAD];
+        chunk[..end - offset].copy_from_slice(&bits[offset..end]);
+        chunks.push(Arc::new(chunk));
+        offset = end;
     }
 
-    let bit = start % 8;
-    if bit != 0 {
-        let mask = u8::MAX << bit;
-        if bitmap[byte_index] & mask != 0 {
-            return Ok(false);
-        }
-        return Ok(bitmap[byte_index + 1..].iter().all(|byte| *byte == 0));
-    }
-
-    Ok(bitmap[byte_index..].iter().all(|byte| *byte == 0))
+    chunks
 }
 
 fn bit_index(id: u64, limit: u64) -> Result<(usize, u8), SpaceError> {
@@ -1439,6 +1505,7 @@ fn seal_page(page: &mut [u8; PAGE_SIZE], kind: PageKind, page_id: PageId) {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use super::{
         EXTENT_PAGES, INITIAL_PAGES, MAX_BITMAP_PAGES, MAX_HINTS, MAX_RETIRE, RETIRE_ENTRY_LEN,
@@ -1876,6 +1943,17 @@ mod tests {
         )
         .expect("load two gibibyte map");
         assert_eq!(loaded.high_water(), wide.high_water());
+    }
+
+    #[test]
+    fn cloning_the_allocator_copies_only_the_changed_bitmap_chunk() {
+        let mut space = Space::create();
+        let cloned = space.clone();
+        assert!(Arc::strong_count(&space.chunks[0]) > 1);
+        space.allocate(leaf()).expect("allocate");
+        assert_eq!(Arc::strong_count(&cloned.chunks[0]), 1);
+        assert!(!cloned.is_allocated(PageId::new(4)));
+        assert!(space.is_allocated(PageId::new(4)));
     }
 
     #[test]

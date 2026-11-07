@@ -51,11 +51,11 @@ Here is how the loss happens. Kept frames (LSN greater than the horizon) are cop
 
 ## Acceptance Criteria
 
-- [ ] The [004](004-crash-consistency-simulation-vfs.md) regression test, which reproduces the prune hazard, passes and is no longer ignored.
+- [x] The [004](004-crash-consistency-simulation-vfs.md) regression test, which reproduces the prune hazard, passes and is no longer ignored.
 - [ ] Exhaustive crash enumeration over "commit N, checkpoint, commit M, checkpoint" histories with at least 10,000 persistence subsets shows that every commit acknowledged under `Durability::Full` survives and that every reopen succeeds.
-- [ ] A stale frame (old generation, valid CRC) placed after the current frames is ignored during recovery (unit test).
-- [ ] No code path overwrites a WAL byte range that holds a frame above the durable checkpoint.
-- [ ] Format version bumped; opening an old-format file returns `UnsupportedVersion`.
+- [x] A stale frame (old generation, valid CRC) placed after the current frames is ignored during recovery (unit test).
+- [x] No code path overwrites a WAL byte range that holds a frame above the durable checkpoint.
+- [x] Format version bumped; opening an old-format file returns `UnsupportedVersion`.
 
 ## Testing and Validation
 

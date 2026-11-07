@@ -48,8 +48,8 @@ Issues [012](012-crash-safe-wal-reset.md), [014](014-scalable-space-allocator.md
 ## Acceptance Criteria
 
 - [ ] The ADR is merged, and every on-disk structure documents its version field.
-- [ ] Golden fixtures exist, and CI fails if a code change alters how a fixture is read.
-- [ ] Opening a file with an unknown incompatible feature flag returns `UnsupportedVersion` with a clear message (test).
+- [x] Golden fixtures exist, and CI fails if a code change alters how a fixture is read.
+- [x] Opening a file with an unknown incompatible feature flag returns `UnsupportedVersion` with a clear message (test).
 - [ ] The ARM64 CI job passes.
 
 ## Testing and Validation

@@ -316,6 +316,70 @@ mod tests {
     }
 
     #[test]
+    fn child_storage_open_is_locked_until_close() {
+        if std::env::var_os("PIZZLYDB_OPEN_CHILD").is_some() {
+            let path = std::env::var("PIZZLYDB_LOCK_PATH").expect("path");
+            let opened = Storage::open(&PosixVfs::new(), Path::new(&path), 4, Durability::Full);
+            let code = match opened {
+                Err(crate::StorageError::Locked) => 2,
+                Ok(_) => 0,
+                Err(_) => 3,
+            };
+            std::process::exit(code);
+        }
+
+        let dir = temp_dir();
+        let path = dir.path().join("db");
+        let vfs = PosixVfs::new();
+        let db = Storage::create(&vfs, &path, 4, Durability::Full, |id| id.fill(7)).unwrap();
+        let blocked = spawn_open_child(&path);
+        assert_eq!(blocked.code(), Some(2));
+        db.close().unwrap();
+        let free = spawn_open_child(&path);
+        assert_eq!(free.code(), Some(0));
+        let _still_here = db;
+    }
+
+    #[test]
+    fn child_process_exit_releases_the_storage_lock() {
+        if std::env::var_os("PIZZLYDB_HOLD_CHILD").is_some() {
+            let path = std::env::var("PIZZLYDB_LOCK_PATH").expect("path");
+            let _db = Storage::open(&PosixVfs::new(), Path::new(&path), 4, Durability::Full)
+                .expect("child open");
+            std::process::exit(0);
+        }
+
+        let dir = temp_dir();
+        let path = dir.path().join("db");
+        let vfs = PosixVfs::new();
+        let db = Storage::create(&vfs, &path, 4, Durability::Full, |id| id.fill(8)).unwrap();
+        drop(db);
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .env("PIZZLYDB_HOLD_CHILD", "1")
+            .env("PIZZLYDB_LOCK_PATH", &path)
+            .args([
+                "--exact",
+                "vfs_posix::tests::child_process_exit_releases_the_storage_lock",
+            ])
+            .status()
+            .expect("spawn");
+        assert_eq!(child.code(), Some(0));
+        assert!(Storage::open(&vfs, &path, 4, Durability::Full).is_ok());
+    }
+
+    fn spawn_open_child(path: &Path) -> std::process::ExitStatus {
+        std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .env("PIZZLYDB_OPEN_CHILD", "1")
+            .env("PIZZLYDB_LOCK_PATH", path)
+            .args([
+                "--exact",
+                "vfs_posix::tests::child_storage_open_is_locked_until_close",
+            ])
+            .status()
+            .expect("spawn")
+    }
+
+    #[test]
     fn read_only_open_and_verify_succeed_on_mode_0444() {
         let dir = temp_dir();
         let vfs = PosixVfs::new();
@@ -331,6 +395,8 @@ mod tests {
         assert!(db.snapshot().unwrap().get(b"k").unwrap().is_none());
         drop(db);
         assert!(verify_quick(&vfs, &path).is_ok());
+        let backup = dir.path().join("bak");
+        assert!(crate::backup::backup(&vfs, &path, &backup).is_ok());
     }
 
     #[test]
