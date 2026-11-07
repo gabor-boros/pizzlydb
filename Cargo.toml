@@ -4,7 +4,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0" # x-release-please-version
+version = "0.2.0" # x-release-please-version
 license = "Apache-2.0"
 publish = false
 authors = ["Gabor Boros <gabor.brs@gmail.com>"]

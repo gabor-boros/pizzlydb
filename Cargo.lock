@@ -70,28 +70,28 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pizzlydb-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
 ]
 
 [[package]]
 name = "pizzlydb-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-sdk",
 ]
 
 [[package]]
 name = "pizzlydb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "pizzlydb-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-storage",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-incremental"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-query",
@@ -110,14 +110,14 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
 ]
 
 [[package]]
 name = "pizzlydb-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-graph",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-protocol",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-auth",
  "pizzlydb-graph",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "tempfile",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-subscriptions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-incremental",
@@ -164,14 +164,14 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
 ]
 
 [[package]]
 name = "pizzlydb-txn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-storage",
