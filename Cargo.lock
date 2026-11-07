@@ -566,6 +566,8 @@ version = "0.1.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-storage",
+ "pizzlydb-testkit",
+ "thiserror",
 ]
 
 [[package]]

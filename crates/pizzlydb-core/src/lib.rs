@@ -30,6 +30,7 @@
 mod error;
 mod id;
 mod key;
+mod mutation;
 mod sequence;
 mod value;
 
@@ -38,6 +39,11 @@ pub use id::{
     EdgeId, ID_LEN, Identifier, IndexId, LabelId, NamespaceId, NodeId, PropertyKeyId, TypeId,
 };
 pub use key::KeyBuf;
+pub use mutation::{
+    DeclarationImage, GraphMutation, IndexImage, catalog_kind, decode_mutation,
+    decode_mutation_list, encode_mutation, encode_mutation_list, scope_kind,
+};
+pub use sequence::CommitSeq;
 pub use value::{
     Value, ValueType, decode_f64_key, decode_i64_key, decode_value, decode_value_key,
     encode_f64_key, encode_i64_key, encode_value, encode_value_key,

@@ -13,7 +13,7 @@ use pizzlydb_storage::{
     Durability, FileRole, OpenOptions, Storage, StorageError, Vfs, VfsError, VfsFile,
 };
 
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::catalog;
 use crate::error::GraphError;
 use crate::property::Scope;
@@ -146,7 +146,7 @@ pub struct LoadReport {
 /// use std::path::Path;
 ///
 /// use pizzlydb_core::{NamespaceId, NodeId};
-/// use pizzlydb_graph::{GraphStore, LoadOptions, bulk_load};
+/// use pizzlydb_graph::{GraphTxn, GraphStore, LoadOptions, bulk_load};
 /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 ///
 /// let vfs = MemoryVfs::new();
@@ -167,7 +167,7 @@ pub struct LoadReport {
 /// # Ok(())
 /// # }
 /// ```
-pub fn bulk_load<V: Vfs>(
+pub fn bulk_load<V: Vfs + 'static>(
     vfs: &V,
     script: &str,
     destination: &Path,
@@ -188,7 +188,7 @@ pub fn bulk_load<V: Vfs>(
     })?;
     let graph = GraphStore::new(namespace);
     {
-        let mut batch = GraphBatch::begin(&storage)?;
+        let mut batch = GraphTxn::begin(&storage)?;
         apply_runs(vfs, &graph, &mut batch, script, &runs, options.temp_budget)?;
         batch.commit()?;
     }
@@ -447,7 +447,7 @@ fn spill<V: Vfs>(
 fn apply_runs<V: Vfs>(
     vfs: &V,
     graph: &GraphStore,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     script: &str,
     runs: &[PathBuf],
     budget: u64,
@@ -496,7 +496,7 @@ fn memory_items(script: &str, budget: u64) -> Result<Vec<Item>, GraphError> {
 
 fn apply_items<V: Vfs>(
     graph: &GraphStore,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     items: &[Item],
 ) -> Result<(), GraphError> {
     let mut ids = Ids {
@@ -516,7 +516,7 @@ struct Ids {
 
 fn apply_command<V: Vfs>(
     graph: &GraphStore,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     ids: &mut Ids,
     command: &Command,
 ) -> Result<(), GraphError> {
@@ -588,7 +588,7 @@ fn apply_command<V: Vfs>(
 
 fn lookup_label<V: Vfs>(
     graph: &GraphStore,
-    batch: &GraphBatch<'_, V>,
+    batch: &GraphTxn<V>,
     name: &str,
 ) -> Result<LabelId, GraphError> {
     graph.lookup(batch, name)?.ok_or(GraphError::NotFound)
@@ -596,7 +596,7 @@ fn lookup_label<V: Vfs>(
 
 fn lookup_type<V: Vfs>(
     graph: &GraphStore,
-    batch: &GraphBatch<'_, V>,
+    batch: &GraphTxn<V>,
     name: &str,
 ) -> Result<TypeId, GraphError> {
     graph.lookup(batch, name)?.ok_or(GraphError::NotFound)
@@ -604,7 +604,7 @@ fn lookup_type<V: Vfs>(
 
 fn lookup_key<V: Vfs>(
     graph: &GraphStore,
-    batch: &GraphBatch<'_, V>,
+    batch: &GraphTxn<V>,
     name: &str,
 ) -> Result<PropertyKeyId, GraphError> {
     graph.lookup(batch, name)?.ok_or(GraphError::NotFound)

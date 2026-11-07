@@ -10,16 +10,16 @@
 //! Tombstones are never removed by this crate, so a deleted id stays
 //! [`GraphError::Deleted`].
 //!
-//! Server-generated ids come from one counter key per identifier kind. The
-//! counter holds the last issued id as a big-endian `u128`. Allocation stages
-//! the new counter value in the same batch as the record that uses it. A
-//! counter only moves forward, so an id is never issued twice.
+//! Server-generated ids come from the transaction allocator. Each namespace
+//! and id kind has its own sequence. The persisted watermark lives in the
+//! system key space, not in a graph counter key. A deleted id keeps a
+//! tombstone, so a later read returns [`GraphError::Deleted`].
 
-use pizzlydb_core::{EdgeId, ID_LEN, Identifier, NamespaceId, NodeId};
+use pizzlydb_core::{EdgeId, Identifier, NamespaceId, NodeId};
 use pizzlydb_storage::Vfs;
 
 use crate::access::KeyRead;
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::error::{GraphError, corrupt};
 use crate::keys;
 use crate::property::Owner;
@@ -67,23 +67,15 @@ pub(crate) fn ensure_live<R: KeyRead>(
     }
 }
 
-/// Issue the next identifier of `id_kind` and stage the counter update.
+/// Issue the next identifier of `id_kind`.
+///
+/// The id comes from the transaction manager's block allocator, not from a
+/// counter key in the read set.
 pub(crate) fn allocate<I: Identifier, V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     id_kind: u8,
 ) -> Result<I, GraphError> {
-    let key = keys::counter(namespace, id_kind);
-    let last = match batch.get(&key)? {
-        None => 0,
-        Some(bytes) => {
-            u128::from_be_bytes(<[u8; ID_LEN]>::try_from(bytes.as_slice()).map_err(corrupt)?)
-        }
-    };
-
-    let next = last.checked_add(1).ok_or(GraphError::IdExhausted)?;
-    let id = I::from_bytes(next.to_be_bytes()).map_err(corrupt)?;
-    batch.put(key, next.to_be_bytes().to_vec())?;
-
-    Ok(id)
+    let next = batch.allocate_id(namespace, id_kind)?;
+    I::from_bytes(next.to_be_bytes()).map_err(corrupt)
 }

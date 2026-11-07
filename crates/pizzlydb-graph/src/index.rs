@@ -29,7 +29,7 @@ use pizzlydb_core::{
 use pizzlydb_storage::Vfs;
 
 use crate::access::{IdScan, KeyRead, PrefixScan, id_at};
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::catalog;
 use crate::constraint;
 use crate::directory;
@@ -51,7 +51,7 @@ const DEFINITION_LEN: usize = 3 + 2 * ID_LEN;
 /// use std::path::Path;
 ///
 /// use pizzlydb_core::{LabelId, NamespaceId, PropertyKeyId};
-/// use pizzlydb_graph::{GraphBatch, GraphStore, IndexDefinition, Scope};
+/// use pizzlydb_graph::{GraphTxn, GraphBatch, GraphStore, IndexDefinition, Scope};
 /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 ///
 /// let vfs = MemoryVfs::new();
@@ -269,7 +269,7 @@ impl GraphStore {
     /// ```
     pub fn create_index<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         scope: Scope,
         key: PropertyKeyId,
         unique: bool,
@@ -302,6 +302,17 @@ impl GraphStore {
                 }
             }
 
+            batch.record(pizzlydb_core::GraphMutation::IndexCreate {
+                namespace,
+                index,
+                definition: pizzlydb_core::IndexImage {
+                    scope_kind: scope.kind(),
+                    scope: *scope.id_bytes(),
+                    property: key,
+                    unique,
+                },
+            });
+            batch.record(pizzlydb_core::GraphMutation::IndexReady { namespace, index });
             Ok(index)
         })
     }
@@ -603,7 +614,7 @@ struct Target {
 /// Move the entries of `owner` for property `key` from `previous` to
 /// `current` in every index on the key within the owner's scopes.
 pub(crate) fn apply_property_index<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     owner: Owner,
     key: PropertyKeyId,
@@ -631,7 +642,7 @@ pub(crate) fn apply_property_index<V: Vfs>(
 /// Update the entries of `node` in every index scoped to a removed or added
 /// label.
 pub(crate) fn sync_labels<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     node: NodeId,
     removed: &[LabelId],
@@ -659,7 +670,7 @@ pub(crate) fn sync_labels<V: Vfs>(
 
 /// Stage the relationship-type membership key of a new edge.
 pub(crate) fn note_edge<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     edge: &EdgeRecord,
 ) -> Result<(), GraphError> {
@@ -671,7 +682,7 @@ pub(crate) fn note_edge<V: Vfs>(
 
 /// Stage removal of the relationship-type membership key of an edge.
 pub(crate) fn forget_edge<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     edge: &EdgeRecord,
 ) -> Result<(), GraphError> {
@@ -679,7 +690,7 @@ pub(crate) fn forget_edge<V: Vfs>(
 }
 
 fn insert_entry<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     target: &Target,
     owner: Owner,
@@ -699,7 +710,7 @@ fn insert_entry<V: Vfs>(
 }
 
 fn remove_entry<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     target: &Target,
     owner: Owner,

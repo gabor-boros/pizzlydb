@@ -4,7 +4,8 @@
 //! are 16 bytes. `value` is the key format of
 //! [`encode_value_key`](pizzlydb_core::encode_value_key).
 //!
-//! - `0x01` counter: `id_kind` to the last issued id, big-endian `u128`.
+//! - `0x01` counter: unused. Ids come from the system allocator.
+//!   Older files may still contain `id_kind` to the last issued id.
 //! - `0x02` node: `node` to a node record.
 //! - `0x03` edge: `edge` to an edge record.
 //! - `0x04` name: `id_kind || name` to the id.
@@ -32,7 +33,22 @@ use pizzlydb_core::{
 use crate::error::{GraphError, invalid_value};
 use crate::property::{Owner, Scope};
 
+/// Unused kind. Ids come from the system allocator.
+#[allow(dead_code)]
 const COUNTER: u8 = 0x01;
+
+#[cfg(test)]
+mod layout_tests {
+    use super::COUNTER;
+    use pizzlydb_core::{KeyBuf, NamespaceId};
+
+    #[test]
+    fn counter_kind_stays_reserved() {
+        let namespace = NamespaceId::from_u128(1).unwrap();
+        let key = super::counter(namespace, 1);
+        assert_eq!(key[KeyBuf::PREFIX_LEN - 1], COUNTER);
+    }
+}
 const NODE: u8 = 0x02;
 const EDGE: u8 = 0x03;
 const NAME: u8 = 0x04;
@@ -63,6 +79,7 @@ pub(crate) mod id_kind {
     pub(crate) const INDEX: u8 = 6;
 }
 
+#[allow(dead_code)]
 pub(crate) fn counter(namespace: NamespaceId, id_kind: u8) -> Vec<u8> {
     let mut key = KeyBuf::new(namespace, COUNTER);
     key.push_u8(id_kind);

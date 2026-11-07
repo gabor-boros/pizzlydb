@@ -26,4 +26,13 @@ pub enum CoreError {
     /// Encoded input ends before a complete item.
     #[error("input is truncated")]
     Truncated,
+    /// A commit sequence was zero or could not be decoded.
+    #[error("invalid commit sequence")]
+    InvalidSequence,
+    /// The next commit sequence would not fit in a `u64`.
+    #[error("commit sequence overflow")]
+    SequenceOverflow,
+    /// A logical mutation could not be decoded.
+    #[error("invalid mutation")]
+    InvalidMutation,
 }

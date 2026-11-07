@@ -98,9 +98,9 @@ pub trait KeyRead {
     }
 }
 
-impl<'db, V: Vfs> KeyRead for ReadView<'db, V> {
+impl<V: Vfs> KeyRead for ReadView<V> {
     type Scan<'a>
-        = Scan<'a, 'db, V>
+        = Scan<'a, V>
     where
         Self: 'a;
 

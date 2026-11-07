@@ -1,6 +1,7 @@
 //! Errors returned by graph operations.
 
 use pizzlydb_storage::StorageError;
+use pizzlydb_txn::TxnError;
 use thiserror::Error;
 
 /// Failure from a [`GraphStore`](crate::GraphStore) operation.
@@ -74,6 +75,12 @@ pub enum GraphError {
     /// The storage engine failed.
     #[error(transparent)]
     Storage(#[from] StorageError),
+    /// The transaction manager rejected the operation.
+    ///
+    /// [`TxnError::is_retryable`](pizzlydb_txn::TxnError::is_retryable) reports
+    /// whether a new transaction can retry the work. Conflicts are retryable.
+    #[error(transparent)]
+    Transaction(TxnError),
 }
 
 pub(crate) fn corrupt<E>(_: E) -> GraphError {
@@ -82,4 +89,15 @@ pub(crate) fn corrupt<E>(_: E) -> GraphError {
 
 pub(crate) fn invalid_value<E>(_: E) -> GraphError {
     GraphError::InvalidValue
+}
+
+impl From<TxnError> for GraphError {
+    fn from(err: TxnError) -> Self {
+        match err {
+            TxnError::Storage(err) => Self::Storage(err),
+            TxnError::IdExhausted => Self::IdExhausted,
+            TxnError::InvalidClientId | TxnError::ClientIdsDisabled => Self::InvalidIdentity,
+            other => Self::Transaction(other),
+        }
+    }
 }

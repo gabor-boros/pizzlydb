@@ -28,7 +28,7 @@ use pizzlydb_core::{
 use pizzlydb_storage::Vfs;
 
 use crate::access::{IdScan, KeyRead, id_at};
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::catalog;
 use crate::directory;
 use crate::error::{GraphError, corrupt, invalid_value};
@@ -244,7 +244,7 @@ impl GraphStore {
     /// use std::path::Path;
     ///
     /// use pizzlydb_core::{LabelId, NamespaceId, PropertyKeyId, ValueType};
-    /// use pizzlydb_graph::{GraphBatch, GraphError, GraphStore, PropertyDeclaration, Scope};
+    /// use pizzlydb_graph::{GraphTxn, GraphBatch, GraphError, GraphStore, PropertyDeclaration, Scope};
     /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
     ///
     /// let vfs = MemoryVfs::new();
@@ -272,7 +272,7 @@ impl GraphStore {
     /// ```
     pub fn declare<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         scope: Scope,
         key: PropertyKeyId,
         declaration: PropertyDeclaration,
@@ -281,7 +281,8 @@ impl GraphStore {
         scope.ensure_issued(batch, namespace)?;
         catalog::ensure_issued(batch, namespace, key)?;
 
-        if let Some(current) = self.declaration(batch, scope, key)? {
+        let existing = self.declaration(batch, scope, key)?;
+        if let Some(current) = existing {
             if current == declaration {
                 return Ok(());
             }
@@ -296,7 +297,23 @@ impl GraphStore {
         batch.put(
             keys::declaration(namespace, scope, key),
             declaration.encode(),
-        )
+        )?;
+        batch.record(pizzlydb_core::GraphMutation::DeclarationChange {
+            namespace,
+            scope_kind: scope.kind(),
+            scope: *scope.id_bytes(),
+            key,
+            previous: existing.map(|current| pizzlydb_core::DeclarationImage {
+                value_type: current.value_type,
+                nullable: current.nullable,
+            }),
+            declaration: Some(pizzlydb_core::DeclarationImage {
+                value_type: declaration.value_type,
+                nullable: declaration.nullable,
+            }),
+        });
+
+        Ok(())
     }
 
     /// Declaration of `key` within `scope`, or [`None`].
@@ -384,7 +401,7 @@ impl GraphStore {
     /// ```
     pub fn set_property<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         owner: impl Into<Owner>,
         key: PropertyKeyId,
         value: &Value,
@@ -401,6 +418,7 @@ impl GraphStore {
 
         let previous = read_cell(batch, namespace, owner, key)?;
         let declared = declaration.is_some();
+        let (node, edge) = owner_ids(owner);
         batch.atomic(|batch| {
             batch.put(keys::cell(namespace, declared, owner, key), encoded)?;
             batch.delete(keys::cell(namespace, !declared, owner, key))?;
@@ -411,7 +429,16 @@ impl GraphStore {
                 key,
                 previous.as_ref(),
                 Some(value),
-            )
+            )?;
+            batch.record(pizzlydb_core::GraphMutation::PropertySet {
+                namespace,
+                node,
+                edge,
+                key,
+                previous: previous.clone(),
+                value: value.clone(),
+            });
+            Ok(())
         })
     }
 
@@ -495,7 +522,7 @@ impl GraphStore {
     /// ```
     pub fn clear_property<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         owner: impl Into<Owner>,
         key: PropertyKeyId,
     ) -> Result<(), GraphError> {
@@ -508,7 +535,7 @@ impl GraphStore {
 
 /// Remove every property of `owner`.
 pub(crate) fn clear_all<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     owner: Owner,
 ) -> Result<(), GraphError> {
@@ -532,7 +559,7 @@ pub(crate) fn clear_all<V: Vfs>(
 }
 
 fn clear_cell<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     owner: Owner,
     key: PropertyKeyId,
@@ -545,7 +572,22 @@ fn clear_cell<V: Vfs>(
         batch.delete(keys::cell(namespace, declared, owner, key))?;
     }
 
+    let (node, edge) = owner_ids(owner);
+    batch.record(pizzlydb_core::GraphMutation::PropertyClear {
+        namespace,
+        node,
+        edge,
+        key,
+        previous: previous.clone(),
+    });
     index::apply_property_index(batch, namespace, owner, key, Some(&previous), None)
+}
+
+fn owner_ids(owner: Owner) -> (Option<NodeId>, Option<EdgeId>) {
+    match owner {
+        Owner::Node(node) => (Some(node), None),
+        Owner::Edge(edge) => (None, Some(edge)),
+    }
 }
 
 /// Effective value of `key`: the declared cell, else the undeclared cell.

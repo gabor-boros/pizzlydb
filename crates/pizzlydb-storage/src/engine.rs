@@ -11,12 +11,14 @@
 //! does not carry the root. The state page is how a commit names its root
 //! before checkpoint.
 
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -26,7 +28,9 @@ use crate::page::{
     ALLOCATOR_PAGE_ID, BITMAP_PAGE_ID, HEADER_SIZE, LSN_OFFSET, Lsn, PAGE_SIZE, PageHeader, PageId,
     PageKind, seal,
 };
-use crate::pager::{Pager, PagerError, PagerStats, SnapshotGuard};
+use crate::pager::{OwnedSnapshot, Pager, PagerError, PagerStats, SnapshotGuard, SnapshotSpec};
+
+pub use crate::pager::{SnapshotInfo, SnapshotKind};
 use crate::space::{INITIAL_PAGES, Space, SpaceError, SpillImage};
 use crate::superblock::{self, Superblock, SuperblockError};
 use crate::vfs::{
@@ -197,6 +201,11 @@ pub enum StorageError {
     /// publish does not write again.
     #[error("storage is closed")]
     Closed,
+    /// The snapshot was unregistered because it outlived its age limit.
+    ///
+    /// The read returns no bytes. Retry against a new snapshot.
+    #[error("snapshot is too old")]
+    SnapshotTooOld,
 }
 
 impl From<VfsError> for StorageError {
@@ -329,7 +338,7 @@ pub struct Storage<V: Vfs> {
 }
 
 struct Inner<V: Vfs> {
-    pager: Pager<V::File, V::File>,
+    pager: Arc<Pager<V::File, V::File>>,
     db: Mutex<DbState>,
     durability: Durability,
     limits: Mutex<BatchLimits>,
@@ -343,6 +352,10 @@ struct Inner<V: Vfs> {
     sync_cv: Condvar,
     checker: Mutex<Option<JoinHandle<()>>>,
     shutdown: AtomicBool,
+    /// Optional monotonic clock for tests. `None` uses process time.
+    time_override: Mutex<Option<Arc<AtomicU64>>>,
+    /// Crate-private slot. The transaction manager stores a weak handle here.
+    extensions: Mutex<Option<Box<dyn Any + Send + Sync>>>,
 }
 
 struct SyncGroup {
@@ -360,6 +373,14 @@ struct DbState {
     closed: bool,
     degraded: bool,
     read_only: bool,
+}
+
+impl<V: Vfs> Clone for Storage<V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<V: Vfs> Storage<V> {
@@ -415,7 +436,7 @@ impl<V: Vfs> Storage<V> {
         let (superblock, current_copy) = write_new_main(&mut main, file_id, &space)?;
         let wal_file = vfs.open(&wal_path(path), FileRole::Wal, &exclusive)?;
         let wal = Wal::create(wal_file, file_id).map_err(map_wal)?;
-        let pager = Pager::open(main, wal, frame_count).map_err(map_pager)?;
+        let pager = Arc::new(Pager::open(main, wal, frame_count).map_err(map_pager)?);
         vfs.sync_dir(parent_dir(path))?;
 
         let storage = Self {
@@ -445,6 +466,8 @@ impl<V: Vfs> Storage<V> {
                 sync_cv: Condvar::new(),
                 checker: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
+                time_override: Mutex::new(None),
+                extensions: Mutex::new(None),
             }),
         };
         Ok(storage)
@@ -560,7 +583,7 @@ impl<V: Vfs> Storage<V> {
         let wal_file = vfs.open(&wal_path(path), FileRole::Wal, &options)?;
         let wal = Wal::open(wal_file, superblock.file_id()).map_err(map_wal)?;
         let checkpoint = superblock.checkpoint_lsn();
-        let pager = Pager::open(main, wal, frame_count).map_err(map_pager)?;
+        let pager = Arc::new(Pager::open(main, wal, frame_count).map_err(map_pager)?);
         pager.recover_floor(checkpoint).map_err(map_pager)?;
         let (root, space) = load_catalog(&pager)?;
 
@@ -591,6 +614,8 @@ impl<V: Vfs> Storage<V> {
                 sync_cv: Condvar::new(),
                 checker: Mutex::new(None),
                 shutdown: AtomicBool::new(false),
+                time_override: Mutex::new(None),
+                extensions: Mutex::new(None),
             }),
         };
         Ok(storage)
@@ -639,13 +664,102 @@ impl<V: Vfs> Storage<V> {
         })
     }
 
-    pub fn snapshot(&self) -> Result<ReadView<'_, V>, StorageError> {
+    pub fn snapshot(&self) -> Result<ReadView<V>, StorageError> {
+        self.snapshot_with(SnapshotKind::Query, String::new(), None)
+    }
+
+    /// Register a snapshot with an owner tag and an optional age limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Closed`] when the handle is shut.
+    pub fn snapshot_with(
+        &self,
+        kind: SnapshotKind,
+        tag: String,
+        max_age: Option<Duration>,
+    ) -> Result<ReadView<V>, StorageError> {
         self.ensure_open()?;
-        let snapshot = self.inner.pager.snapshot();
+        let max_age_ms = max_age.map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+        let snapshot = self.inner.pager.snapshot_owned(SnapshotSpec {
+            kind,
+            tag,
+            now_ms: self.now_ms(),
+            max_age_ms,
+        });
         Ok(ReadView {
-            storage: self,
+            storage: self.clone(),
             snapshot: Some(snapshot),
         })
+    }
+
+    /// Hold a snapshot that stays registered until `ttl` passes without [`SnapshotLease::renew`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Closed`] when the handle is shut.
+    pub fn lease(
+        &self,
+        kind: SnapshotKind,
+        tag: impl Into<String>,
+        ttl: Duration,
+    ) -> Result<SnapshotLease<V>, StorageError> {
+        let view = self.snapshot_with(kind, tag.into(), Some(ttl))?;
+        Ok(SnapshotLease { view })
+    }
+
+    /// Durability stored at create or open.
+    #[must_use]
+    pub fn durability(&self) -> Durability {
+        self.inner.durability
+    }
+
+    /// Milliseconds on the storage clock.
+    ///
+    /// The clock is process time until [`Self::set_time_ms`] replaces it.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        if let Some(clock) = self.inner.time_override.lock().expect("storage").as_ref() {
+            return clock.load(Ordering::Relaxed);
+        }
+        system_now_ms()
+    }
+
+    /// Replace the storage clock. Later calls see `now_ms` until it changes again.
+    pub fn set_time_ms(&self, now_ms: u64) {
+        let mut slot = self.inner.time_override.lock().expect("storage");
+        match slot.as_ref() {
+            Some(clock) => clock.store(now_ms, Ordering::Relaxed),
+            None => *slot = Some(Arc::new(AtomicU64::new(now_ms))),
+        }
+    }
+
+    /// Unregister snapshots that are older than their limit.
+    ///
+    /// A reaped snapshot fails its next read with [`StorageError::SnapshotTooOld`].
+    pub fn reap_snapshots(&self) -> usize {
+        self.inner.pager.reap_snapshots(self.now_ms())
+    }
+
+    /// Registered snapshots and the log bytes the oldest one pins.
+    #[must_use]
+    pub fn inspect_snapshots(&self) -> Vec<SnapshotInfo> {
+        self.inner.pager.inspect_snapshots(self.now_ms())
+    }
+
+    /// Appended write-ahead log length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Io`] when the length cannot be read.
+    pub fn appended_wal_bytes(&self) -> Result<u64, StorageError> {
+        self.inner.pager.wal_appended_bytes().map_err(map_pager)
+    }
+
+    /// Slot used by `pizzlydb-txn` to keep one manager per database handle.
+    #[must_use]
+    pub fn extensions(&self) -> &Mutex<Option<Box<dyn Any + Send + Sync>>> {
+        &self.inner.extensions
     }
 
     /// Start the only open write batch.
@@ -1214,7 +1328,7 @@ impl<V: Vfs> Storage<V> {
 
 impl<V: Vfs> StorageEngine for Storage<V> {
     type ReadView<'a>
-        = ReadView<'a, V>
+        = ReadView<V>
     where
         Self: 'a;
 
@@ -1266,12 +1380,51 @@ impl<V: Vfs> StorageEngine for Storage<V> {
 /// );
 /// ```
 #[must_use = "dropping the view releases its snapshot"]
-pub struct ReadView<'a, V: Vfs> {
-    storage: &'a Storage<V>,
-    snapshot: Option<SnapshotGuard<'a, V::File, V::File>>,
+pub struct ReadView<V: Vfs> {
+    storage: Storage<V>,
+    snapshot: Option<OwnedSnapshot<V::File, V::File>>,
 }
 
-impl<'a, V: Vfs> ReadView<'a, V> {
+/// Renewable registration of one snapshot.
+///
+/// Pagination and bootstrap hold a lease instead of an unbounded read view.
+/// [`Self::renew`] moves the age clock forward. A lapsed lease is removed by
+/// [`Storage::reap_snapshots`], and the next read returns
+/// [`StorageError::SnapshotTooOld`].
+#[must_use = "dropping the lease releases its snapshot"]
+pub struct SnapshotLease<V: Vfs> {
+    view: ReadView<V>,
+}
+
+impl<V: Vfs> SnapshotLease<V> {
+    /// Borrow the pinned snapshot.
+    pub fn view(&self) -> &ReadView<V> {
+        &self.view
+    }
+
+    /// Keep the snapshot registered for another `ttl`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::SnapshotTooOld`] when the registration is already gone.
+    pub fn renew(&self, ttl: Duration) -> Result<(), StorageError> {
+        let Some(snapshot) = self.view.snapshot.as_ref() else {
+            return Err(StorageError::SnapshotTooOld);
+        };
+        let max_age_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        self.view
+            .storage
+            .inner
+            .pager
+            .renew_snapshot(snapshot.id(), self.view.storage.now_ms(), Some(max_age_ms))
+            .map_err(|err| match err {
+                PagerError::SnapshotNotFound => StorageError::SnapshotTooOld,
+                other => map_pager(other),
+            })
+    }
+}
+
+impl<V: Vfs> ReadView<V> {
     /// Sequence captured when the view was created.
     ///
     /// # Examples
@@ -1318,7 +1471,7 @@ impl<'a, V: Vfs> ReadView<'a, V> {
     /// assert!(db.snapshot().unwrap().get(b"missing").unwrap().is_none());
     /// ```
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.ensure_open()?;
+        self.ensure_current()?;
         let root = self.lookup_root()?;
         let pages = self.pages();
         BTree::from_root(root).get(&pages, key).map_err(map_tree)
@@ -1361,8 +1514,8 @@ impl<'a, V: Vfs> ReadView<'a, V> {
     ///     .collect();
     /// assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
     /// ```
-    pub fn scan<'b>(&'b self, from: Option<&[u8]>) -> Result<Scan<'b, 'a, V>, StorageError> {
-        self.ensure_open()?;
+    pub fn scan<'b>(&'b self, from: Option<&[u8]>) -> Result<Scan<'b, V>, StorageError> {
+        self.ensure_current()?;
         let root = self.lookup_root()?;
         let pages = self.pages();
         let cursor = BTree::from_root(root)
@@ -1393,7 +1546,7 @@ impl<'a, V: Vfs> ReadView<'a, V> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         direction: Direction,
-    ) -> Result<Scan<'b, 'a, V>, StorageError> {
+    ) -> Result<Scan<'b, V>, StorageError> {
         if direction == Direction::Reverse {
             let mut rows = Vec::new();
             let mut forward = self.scan_range(start, end, Direction::Forward)?;
@@ -1409,7 +1562,7 @@ impl<'a, V: Vfs> ReadView<'a, V> {
             });
         }
 
-        self.ensure_open()?;
+        self.ensure_current()?;
         let root = self.lookup_root()?;
         let pages = self.pages();
         let cursor = BTree::from_root(root)
@@ -1456,11 +1609,30 @@ impl<'a, V: Vfs> ReadView<'a, V> {
         })
     }
 
+    /// `true` when the registration was reaped.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(OwnedSnapshot::is_expired)
+    }
+
     fn ensure_open(&self) -> Result<(), StorageError> {
         self.storage.ensure_open()
     }
 
-    fn registered(&self) -> &SnapshotGuard<'_, V::File, V::File> {
+    fn ensure_current(&self) -> Result<(), StorageError> {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(OwnedSnapshot::is_expired)
+        {
+            return Err(StorageError::SnapshotTooOld);
+        }
+        self.ensure_open()
+    }
+
+    fn registered(&self) -> &OwnedSnapshot<V::File, V::File> {
         self.snapshot
             .as_ref()
             .expect("snapshot is registered until the view is dropped")
@@ -1485,10 +1657,10 @@ impl<'a, V: Vfs> ReadView<'a, V> {
     }
 }
 
-impl<V: Vfs> Drop for ReadView<'_, V> {
+impl<V: Vfs> Drop for ReadView<V> {
     fn drop(&mut self) {
         self.snapshot.take();
-        let _ = maintain::reclaim_to_horizon(self.storage);
+        let _ = maintain::reclaim_to_horizon(&self.storage);
     }
 }
 
@@ -1513,8 +1685,8 @@ impl<V: Vfs> Drop for ReadView<'_, V> {
 /// assert!(view.scan(None).unwrap().next().is_none());
 /// ```
 #[must_use = "a scan must be driven to read keys"]
-pub struct Scan<'a, 'db, V: Vfs> {
-    view: &'a ReadView<'db, V>,
+pub struct Scan<'a, V: Vfs> {
+    view: &'a ReadView<V>,
     cursor: Cursor,
     done: bool,
     end: Option<Vec<u8>>,
@@ -1534,7 +1706,7 @@ pub struct RangeEstimate {
     pub bytes: u64,
 }
 
-impl<V: Vfs> Iterator for Scan<'_, '_, V> {
+impl<V: Vfs> Iterator for Scan<'_, V> {
     type Item = Result<(Vec<u8>, Vec<u8>), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1801,9 +1973,51 @@ impl<V: Vfs> WriteBatch<V> {
     /// assert!(lsn.as_u64() > 0);
     /// ```
     pub fn commit(mut self, durability: Durability) -> Result<Lsn, StorageError> {
-        let result = self.publish(durability);
+        let result = self.publish(durability, true, |_| Ok(Vec::new()));
         self.committed = result.is_ok();
         result
+    }
+
+    /// Publish the batch. `hook` runs after the commit LSN is chosen and may
+    /// stage more keys, including a record that stores that LSN.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::commit`], and the error returned by `hook`.
+    pub fn commit_with<F>(mut self, durability: Durability, hook: F) -> Result<Lsn, StorageError>
+    where
+        F: FnOnce(Lsn) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, StorageError>,
+    {
+        let result = self.publish(durability, true, hook);
+        self.committed = result.is_ok();
+        result
+    }
+
+    /// Publish the batch and return before the durability wait.
+    ///
+    /// [`CommitAck::acknowledge`] performs that wait. The caller can release
+    /// its own commit lock between the two calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::commit_with`] that happen before sync.
+    pub fn commit_unacked<F>(
+        mut self,
+        durability: Durability,
+        hook: F,
+    ) -> Result<CommitAck<V>, StorageError>
+    where
+        F: FnOnce(Lsn) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, StorageError>,
+    {
+        let lsn = self.publish(durability, false, hook)?;
+        self.committed = true;
+        Ok(CommitAck {
+            storage: Storage {
+                inner: Arc::clone(&self.inner),
+            },
+            durability,
+            lsn,
+        })
     }
 
     fn ensure_open(&self) -> Result<(), StorageError> {
@@ -1815,50 +2029,33 @@ impl<V: Vfs> WriteBatch<V> {
     }
 
     fn join_group(&self, max_delay: Duration) -> Result<(), StorageError> {
-        let mut group = self.inner.sync_group.lock().expect("storage");
-        if group.flushing {
-            let epoch = group.epoch;
-            while group.epoch == epoch {
-                group = self.inner.sync_cv.wait(group).expect("storage");
-            }
-            return if group.failed {
-                Err(StorageError::Io(io_error("group sync failed")))
-            } else {
-                Ok(())
-            };
-        }
-
-        group.flushing = true;
-        drop(group);
-        if !max_delay.is_zero() {
-            thread::sleep(max_delay);
-        }
-        let result = self.inner.pager.sync_group().map_err(map_pager);
-        if result.is_err() {
-            self.inner.pager.discard_wal_tail();
-            self.inner.db.lock().expect("storage").closed = true;
-        }
-        let mut group = self.inner.sync_group.lock().expect("storage");
-        group.flushing = false;
-        group.failed = result.is_err();
-        group.epoch = group.epoch.wrapping_add(1);
-        self.inner.sync_cv.notify_all();
-        result
+        join_group(&self.inner, max_delay)
     }
 
-    fn publish(&mut self, durability: Durability) -> Result<Lsn, StorageError> {
-        let gate = self.inner.gate.lock().expect("storage");
+    fn publish<F>(
+        &mut self,
+        durability: Durability,
+        wait: bool,
+        hook: F,
+    ) -> Result<Lsn, StorageError>
+    where
+        F: FnOnce(Lsn) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, StorageError>,
+    {
         self.ensure_open()?;
+        let base = self.inner.pager.committed_lsn();
+        let next = Lsn::new(base.as_u64().checked_add(1).ok_or(StorageError::Corrupt)?);
+        for (key, value) in hook(next)? {
+            self.stage_change(&key, value.as_deref())?;
+        }
+        let gate = self.inner.gate.lock().expect("storage");
         if self.stage.is_empty() {
-            return Ok(self.inner.pager.committed_lsn());
+            return Ok(base);
         }
 
         let (root, space) = {
             let db = self.inner.db.lock().expect("storage");
             (db.root, db.space.clone())
         };
-        let base = self.inner.pager.committed_lsn();
-        let next = Lsn::new(base.as_u64().checked_add(1).ok_or(StorageError::Corrupt)?);
 
         let mut overlay = Overlay::open(&self.inner.pager, space.clone(), next);
         let mut tree = BTree::from_root(root);
@@ -1905,9 +2102,10 @@ impl<V: Vfs> WriteBatch<V> {
             });
         }
 
-        match self.inner.pager.commit_pages(&images, durability) {
+        let wal_mode = if wait { durability } else { Durability::None };
+        match self.inner.pager.commit_pages(&images, wal_mode) {
             Ok(lsn) => {
-                let grouped = matches!(durability, Durability::Grouped { .. });
+                let grouped = wait && matches!(durability, Durability::Grouped { .. });
                 {
                     let mut db = self.inner.db.lock().expect("storage");
                     db.root = new_root;
@@ -1916,7 +2114,9 @@ impl<V: Vfs> WriteBatch<V> {
                         db.writer = false;
                     }
                 }
-                if let Durability::Grouped { max_delay } = durability {
+                if let Durability::Grouped { max_delay } = durability
+                    && wait
+                {
                     self.committed = true;
                     drop(gate);
                     self.join_group(max_delay)?;
@@ -1946,6 +2146,74 @@ impl<V: Vfs> Drop for WriteBatch<V> {
         let _published = self.committed;
         self.inner.db.lock().expect("storage").writer = false;
     }
+}
+
+/// A commit that is visible in memory and still waiting for its durability sync.
+pub struct CommitAck<V: Vfs> {
+    storage: Storage<V>,
+    durability: Durability,
+    lsn: Lsn,
+}
+
+impl<V: Vfs> CommitAck<V> {
+    /// Log sequence assigned to the commit.
+    #[must_use]
+    pub const fn lsn(&self) -> Lsn {
+        self.lsn
+    }
+
+    /// Wait until the durability mode is satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Io`] when the sync fails. A failure closes the handle.
+    pub fn acknowledge(self) -> Result<Lsn, StorageError> {
+        match self.durability {
+            Durability::Full => self.storage.sync().map(|()| self.lsn),
+            Durability::Grouped { max_delay } => {
+                join_group(&self.storage.inner, max_delay)?;
+                Ok(self.lsn)
+            }
+            Durability::None | Durability::Deferred { .. } => Ok(self.lsn),
+        }
+    }
+}
+
+fn join_group<V: Vfs>(inner: &Inner<V>, max_delay: Duration) -> Result<(), StorageError> {
+    let mut group = inner.sync_group.lock().expect("storage");
+    if group.flushing {
+        let epoch = group.epoch;
+        while group.epoch == epoch {
+            group = inner.sync_cv.wait(group).expect("storage");
+        }
+        return if group.failed {
+            Err(StorageError::Io(io_error("group sync failed")))
+        } else {
+            Ok(())
+        };
+    }
+
+    group.flushing = true;
+    drop(group);
+    if !max_delay.is_zero() {
+        thread::sleep(max_delay);
+    }
+    let result = inner.pager.sync_group().map_err(map_pager);
+    if result.is_err() {
+        inner.pager.discard_wal_tail();
+        inner.db.lock().expect("storage").closed = true;
+    }
+    let mut group = inner.sync_group.lock().expect("storage");
+    group.flushing = false;
+    group.failed = result.is_err();
+    group.epoch = group.epoch.wrapping_add(1);
+    inner.sync_cv.notify_all();
+    result
+}
+
+fn system_now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn stamp(image: &mut [u8; PAGE_SIZE], lsn: Lsn) -> Result<(), StorageError> {

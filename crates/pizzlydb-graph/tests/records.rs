@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use common::{Rng, crash_and_reopen, create, dump, graph};
 use pizzlydb_core::{EdgeId, NodeId, TypeId};
 use pizzlydb_graph::{Direction, GraphBatch, GraphError, GraphStore, KeyRead};
-use pizzlydb_storage::{MemoryVfs, StorageError};
+use pizzlydb_storage::MemoryVfs;
 
 fn node(id: u128) -> NodeId {
     NodeId::from_u128(id).expect("node id")
@@ -239,16 +239,14 @@ fn readers_see_whole_batches() {
 }
 
 #[test]
-fn second_writer_is_busy() {
+fn two_graph_transactions_can_begin() {
     let vfs = MemoryVfs::new();
     let storage = create(&vfs);
-    let batch = GraphBatch::begin(&storage).unwrap();
-    assert!(matches!(
-        GraphBatch::begin(&storage),
-        Err(GraphError::Storage(StorageError::Busy))
-    ));
-    drop(batch);
-    assert!(GraphBatch::begin(&storage).is_ok());
+    let first = GraphBatch::begin(&storage).unwrap();
+    let second = GraphBatch::begin(&storage);
+    assert!(second.is_ok());
+    drop(first);
+    drop(second);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

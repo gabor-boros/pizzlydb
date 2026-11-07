@@ -22,7 +22,7 @@ pub fn records(db: &Storage<impl Vfs>) -> BTreeMap<Vec<u8>, Vec<u8>> {
     scan_view(&view)
 }
 
-pub fn scan_view(view: &ReadView<'_, impl Vfs>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+pub fn scan_view(view: &ReadView<impl Vfs>) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut out = BTreeMap::new();
     for item in view.scan(None).expect("scan") {
         let (key, value) = item.expect("entry");

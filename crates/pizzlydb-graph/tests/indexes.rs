@@ -9,7 +9,9 @@ use common::{Rng, count_kind, crash_and_reopen, create, dump, graph};
 use pizzlydb_core::{
     EdgeId, IndexId, LabelId, NodeId, PropertyKeyId, TypeId, Value, encode_value_key,
 };
-use pizzlydb_graph::{GraphBatch, GraphError, GraphStore, IndexDefinition, KeyRead, Owner, Scope};
+use pizzlydb_graph::{
+    GraphBatch, GraphError, GraphStore, GraphTxn, IndexDefinition, KeyRead, Owner, Scope,
+};
 use pizzlydb_storage::MemoryVfs;
 
 const LABEL_MEMBER: u8 = 0x08;
@@ -53,7 +55,7 @@ struct Fixture {
     plain: IndexId,
 }
 
-fn fixture(graph: &GraphStore, batch: &mut GraphBatch<'_, MemoryVfs>) -> Fixture {
+fn fixture(graph: &GraphStore, batch: &mut GraphTxn<MemoryVfs>) -> Fixture {
     let person = graph.intern(batch, "Person").unwrap();
     let email = graph.intern(batch, "email").unwrap();
     let city = graph.intern(batch, "city").unwrap();
@@ -72,7 +74,7 @@ fn fixture(graph: &GraphStore, batch: &mut GraphBatch<'_, MemoryVfs>) -> Fixture
     }
 }
 
-fn person(graph: &GraphStore, batch: &mut GraphBatch<'_, MemoryVfs>, label: LabelId) -> NodeId {
+fn person(graph: &GraphStore, batch: &mut GraphTxn<MemoryVfs>, label: LabelId) -> NodeId {
     let node = graph.create_node(batch).unwrap();
     graph.add_label(batch, node, label).unwrap();
     node
@@ -293,7 +295,7 @@ fn building_an_index_covers_existing_members() {
 
 fn person_with(
     graph: &GraphStore,
-    batch: &mut GraphBatch<'_, MemoryVfs>,
+    batch: &mut GraphTxn<MemoryVfs>,
     label: LabelId,
     key: PropertyKeyId,
     value: Value,

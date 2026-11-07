@@ -8,7 +8,7 @@ use pizzlydb_core::{
     EdgeId, IndexId, LabelId, NamespaceId, NodeId, PropertyKeyId, TypeId, encode_value,
 };
 use pizzlydb_graph::{
-    Direction, GraphBatch, GraphError, GraphStore, Owner, PropertyDeclaration, Scope,
+    Direction, GraphBatch, GraphError, GraphStore, GraphTxn, Owner, PropertyDeclaration, Scope,
 };
 use pizzlydb_storage::{Durability, FileRole, MemoryVfs, Storage, Vfs, wal_path};
 use pizzlydb_testkit::{
@@ -83,7 +83,7 @@ impl Subject for Engine {
     }
 }
 
-fn apply_op<V: Vfs>(batch: &mut GraphBatch<'_, V>, op: &Operation) -> Result<(), StepError> {
+fn apply_op<V: Vfs>(batch: &mut GraphTxn<V>, op: &Operation) -> Result<(), StepError> {
     match op {
         Operation::CreateNode { namespace } => store(*namespace)?
             .create_node(batch)

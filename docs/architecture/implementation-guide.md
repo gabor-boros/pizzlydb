@@ -151,9 +151,9 @@ Use the in-house **page engine** behind a narrow Rust `StorageEngine` trait. The
 ### 4.2 Versioning model
 
 - Each committed transaction receives a monotonically increasing **`CommitSeq`** within the database's current leader epoch.
-- Graph records and index entries are logically versioned by commit sequence; as-of reads select the newest visible version at or before their snapshot sequence.
-- Pager snapshots provide physical scan consistency; logical MVCC permits as-of resolution according to pizzlydb's retention policy. Neither mechanism is a substitute for the other.
-- Tombstones represent deletions and remain until no supported snapshot, checkpoint, or recovery operation requires their history.
+- [ADR-004](../adr/0004-transaction-isolation.md) supersedes per-record logical versions for v1. As-of reads retain physical page versions at a protected snapshot. The logical mutation log, not a second copy of each record, is the history of a commit.
+- Pager snapshots provide physical scan consistency. They are not a `CommitSeq`.
+- Tombstones represent deletions and remain until retention or compaction removes them ([ADR-002](../adr/0002-identity-and-value-model.md)).
 - Compaction and retention are driven by the minimum pinned read sequence, backup boundaries, and maintained-state recovery boundaries.
 
 **Invariant S1:** A read at snapshot `S` sees precisely the committed graph state at `S`, including its indexes and constraints.

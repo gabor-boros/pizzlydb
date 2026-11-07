@@ -27,7 +27,8 @@ Every encoder rejects NaN and writes `-0.0` as `+0.0`. Every decoder rejects mal
 - `id` — identifiers
 - `value` — values and both encodings
 - `key` — key builder
-- `sequence` — monotonic `CommitSeq` values (not yet implemented)
+- `sequence` — `CommitSeq`
+- `mutation` — logical graph mutations
 - `error` — errors for those types
 
 ## License

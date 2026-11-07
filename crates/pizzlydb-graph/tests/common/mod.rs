@@ -42,6 +42,7 @@ pub fn dump(read: &impl KeyRead) -> BTreeMap<Vec<u8>, Vec<u8>> {
     read.scan(&[])
         .expect("scan")
         .map(|entry| entry.expect("entry"))
+        .filter(|(key, _)| key.len() < 16 || key[..16] != [0; 16])
         .collect()
 }
 

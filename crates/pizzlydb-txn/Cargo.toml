@@ -16,6 +16,10 @@ rust-version.workspace = true
 [dependencies]
 pizzlydb-core = { path = "../pizzlydb-core" }
 pizzlydb-storage = { path = "../pizzlydb-storage" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pizzlydb-testkit = { path = "../pizzlydb-testkit" }
 
 [lints]
 workspace = true

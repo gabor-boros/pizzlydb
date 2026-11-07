@@ -10,7 +10,7 @@ use pizzlydb_core::{EdgeId, NamespaceId, NodeId, TypeId};
 use pizzlydb_storage::Vfs;
 
 use crate::access::{KeyRead, PrefixScan, id_at};
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::error::GraphError;
 use crate::keys::{self, ADJACENCY_EDGE, ADJACENCY_LEN, ADJACENCY_NEIGHBOR, ADJACENCY_TYPE};
 use crate::record::EdgeRecord;
@@ -51,7 +51,7 @@ impl Direction {
 /// use std::path::Path;
 ///
 /// use pizzlydb_core::{NamespaceId, TypeId};
-/// use pizzlydb_graph::{Direction, GraphBatch, GraphStore, Neighbor};
+/// use pizzlydb_graph::{GraphTxn, Direction, GraphBatch, GraphStore, Neighbor};
 /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 ///
 /// let vfs = MemoryVfs::new();
@@ -245,7 +245,7 @@ impl GraphStore {
 
 /// Stage the outgoing and incoming keys of `edge`.
 pub(crate) fn link<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     edge: &EdgeRecord,
 ) -> Result<(), GraphError> {
@@ -256,7 +256,7 @@ pub(crate) fn link<V: Vfs>(
 
 /// Stage removal of the outgoing and incoming keys of `edge`.
 pub(crate) fn unlink<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     edge: &EdgeRecord,
 ) -> Result<(), GraphError> {

@@ -13,7 +13,7 @@ use pizzlydb_core::{
 use pizzlydb_storage::{Durability, FileRole, OpenOptions, Storage, StorageError, Vfs, VfsError};
 
 use crate::access::{IdScan, KeyRead, PrefixScan, id_at};
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::catalog::CatalogId;
 use crate::error::GraphError;
 use crate::keys::{self, id_kind};
@@ -32,7 +32,7 @@ const FRAME_COUNT: usize = 32;
 /// # Examples
 ///
 /// ```
-/// use pizzlydb_graph::{Omission, OmissionKind, OmissionReason};
+/// use pizzlydb_graph::{GraphTxn, Omission, OmissionKind, OmissionReason};
 ///
 /// let omission = Omission {
 ///     kind: OmissionKind::Node,
@@ -191,7 +191,7 @@ pub struct SalvageReport {
 /// # Ok(())
 /// # }
 /// ```
-pub fn salvage<V: Vfs>(
+pub fn salvage<V: Vfs + 'static>(
     vfs: &V,
     source: &Path,
     destination: &Path,
@@ -221,7 +221,7 @@ pub fn salvage<V: Vfs>(
     }
 
     {
-        let mut batch = GraphBatch::begin(&dest_db)?;
+        let mut batch = GraphTxn::begin(&dest_db)?;
         copy_namespace(&graph, &view, &mut batch, &mut report)?;
         batch.commit()?;
     }
@@ -301,7 +301,7 @@ struct Copied {
 fn copy_namespace<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     report: &mut SalvageReport,
 ) -> Result<(), GraphError> {
     let mut copied = Copied {
@@ -351,7 +351,7 @@ fn copy_namespace<R: KeyRead, V: Vfs>(
 fn copy_names<I, R, V>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     kind_byte: u8,
     kind: OmissionKind,
     copied: &mut BTreeMap<I, I>,
@@ -400,7 +400,7 @@ where
 fn copy_nodes<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &mut Copied,
     report: &mut SalvageReport,
 ) -> Result<(), GraphError> {
@@ -436,7 +436,7 @@ fn copy_nodes<R: KeyRead, V: Vfs>(
 fn copy_label_sets<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &Copied,
     report: &mut SalvageReport,
 ) -> Result<(), GraphError> {
@@ -484,7 +484,7 @@ fn collect_labels<R: KeyRead>(
 fn copy_declarations<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &Copied,
     report: &mut SalvageReport,
 ) -> Result<(), GraphError> {
@@ -561,7 +561,7 @@ fn copy_declarations<R: KeyRead, V: Vfs>(
 fn copy_owner_properties<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &Copied,
     report: &mut SalvageReport,
     edges: bool,
@@ -595,7 +595,7 @@ fn copy_owner_properties<R: KeyRead, V: Vfs>(
 fn copy_properties<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &Copied,
     report: &mut SalvageReport,
     ends: (Owner, Owner, u128),
@@ -655,7 +655,7 @@ fn copy_properties<R: KeyRead, V: Vfs>(
 fn copy_edges<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &mut Copied,
     report: &mut SalvageReport,
 ) -> Result<(), GraphError> {
@@ -720,7 +720,7 @@ fn copy_edges<R: KeyRead, V: Vfs>(
 fn copy_indexes<R: KeyRead, V: Vfs>(
     graph: &GraphStore,
     source: &R,
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     copied: &Copied,
     report: &mut SalvageReport,
 ) -> Result<(), GraphError> {

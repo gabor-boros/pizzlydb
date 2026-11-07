@@ -16,7 +16,7 @@ use pizzlydb_core::{ID_LEN, Identifier, LabelId, NamespaceId, NodeId, PropertyKe
 use pizzlydb_storage::Vfs;
 
 use crate::access::{IdScan, KeyRead, id_at};
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::directory;
 use crate::error::GraphError;
 use crate::index;
@@ -42,7 +42,7 @@ mod sealed {
 /// use std::path::Path;
 ///
 /// use pizzlydb_core::{LabelId, NamespaceId, TypeId};
-/// use pizzlydb_graph::{CatalogId, GraphBatch, GraphStore, KeyRead};
+/// use pizzlydb_graph::{GraphTxn, CatalogId, GraphBatch, GraphStore, KeyRead};
 /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 ///
 /// fn name_of<I: CatalogId, R: KeyRead>(
@@ -120,7 +120,7 @@ impl GraphStore {
     /// ```
     pub fn intern<I: CatalogId, V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         name: impl AsRef<[u8]>,
     ) -> Result<I, GraphError> {
         let name = valid_name(name.as_ref())?;
@@ -131,6 +131,12 @@ impl GraphStore {
         batch.atomic(|batch| {
             let id: I = directory::allocate(batch, self.namespace(), I::ID_KIND)?;
             self.put_name(batch, id, name)?;
+            batch.record(pizzlydb_core::GraphMutation::CatalogCreate {
+                namespace: self.namespace(),
+                kind: I::ID_KIND,
+                id: *id.as_bytes(),
+                name: name.to_vec(),
+            });
             Ok(id)
         })
     }
@@ -261,7 +267,7 @@ impl GraphStore {
     /// ```
     pub fn rename<I: CatalogId, V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         id: I,
         name: impl AsRef<[u8]>,
     ) -> Result<(), GraphError> {
@@ -277,7 +283,15 @@ impl GraphStore {
 
         batch.atomic(|batch| {
             batch.delete(keys::name(self.namespace(), I::ID_KIND, current.as_bytes()))?;
-            self.put_name(batch, id, name)
+            self.put_name(batch, id, name)?;
+            batch.record(pizzlydb_core::GraphMutation::CatalogRename {
+                namespace: self.namespace(),
+                kind: I::ID_KIND,
+                id: *id.as_bytes(),
+                previous: current.into_bytes(),
+                name: name.to_vec(),
+            });
+            Ok(())
         })
     }
 
@@ -319,7 +333,7 @@ impl GraphStore {
     /// ```
     pub fn add_label<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         node: NodeId,
         label: LabelId,
     ) -> Result<(), GraphError> {
@@ -369,7 +383,7 @@ impl GraphStore {
     /// ```
     pub fn remove_label<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         node: NodeId,
         label: LabelId,
     ) -> Result<(), GraphError> {
@@ -416,7 +430,7 @@ impl GraphStore {
     /// ```
     pub fn set_labels<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         node: NodeId,
         labels: &[LabelId],
     ) -> Result<(), GraphError> {
@@ -523,7 +537,7 @@ impl GraphStore {
 
     fn put_name<I: CatalogId, V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         id: I,
         name: &[u8],
     ) -> Result<(), GraphError> {
@@ -553,7 +567,7 @@ pub(crate) fn ensure_issued<I: CatalogId, R: KeyRead>(
 
 /// Remove every label of `node`.
 pub(crate) fn clear_labels<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     node: NodeId,
 ) -> Result<(), GraphError> {
@@ -573,7 +587,7 @@ fn current_labels<R: KeyRead>(
 }
 
 fn change_labels<V: Vfs>(
-    batch: &mut GraphBatch<'_, V>,
+    batch: &mut GraphTxn<V>,
     namespace: NamespaceId,
     node: NodeId,
     removed: &[LabelId],
@@ -582,11 +596,21 @@ fn change_labels<V: Vfs>(
     for &label in removed {
         batch.delete(keys::node_label(namespace, node, label))?;
         batch.delete(keys::label_member(namespace, label, node))?;
+        batch.record(pizzlydb_core::GraphMutation::LabelRemove {
+            namespace,
+            node,
+            label,
+        });
     }
 
     for &label in added {
         batch.put(keys::node_label(namespace, node, label), Vec::new())?;
         batch.put(keys::label_member(namespace, label, node), Vec::new())?;
+        batch.record(pizzlydb_core::GraphMutation::LabelAdd {
+            namespace,
+            node,
+            label,
+        });
     }
 
     index::sync_labels(batch, namespace, node, removed, added)

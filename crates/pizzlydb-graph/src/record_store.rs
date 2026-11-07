@@ -1,10 +1,10 @@
 //! Node and edge create, read, and delete.
 
-use pizzlydb_core::{EdgeId, NamespaceId, NodeId, TypeId};
+use pizzlydb_core::{EdgeId, GraphMutation, NamespaceId, NodeId, TypeId};
 use pizzlydb_storage::Vfs;
 
 use crate::access::KeyRead;
-use crate::batch::GraphBatch;
+use crate::batch::GraphTxn;
 use crate::error::GraphError;
 use crate::keys::{self, id_kind};
 use crate::property::Owner;
@@ -25,7 +25,7 @@ use crate::{adjacency, catalog, constraint, directory, index, property};
 /// use std::path::Path;
 ///
 /// use pizzlydb_core::NamespaceId;
-/// use pizzlydb_graph::{GraphBatch, GraphError, GraphStore};
+/// use pizzlydb_graph::{GraphTxn, GraphBatch, GraphError, GraphStore};
 /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 ///
 /// let vfs = MemoryVfs::new();
@@ -120,10 +120,14 @@ impl GraphStore {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_node<V: Vfs>(&self, batch: &mut GraphBatch<'_, V>) -> Result<NodeId, GraphError> {
+    pub fn create_node<V: Vfs>(&self, batch: &mut GraphTxn<V>) -> Result<NodeId, GraphError> {
         batch.atomic(|batch| {
             let id = directory::allocate(batch, self.namespace, id_kind::NODE)?;
             batch.put(keys::node(self.namespace, id), encode_node())?;
+            batch.record(GraphMutation::NodeCreate {
+                namespace: self.namespace,
+                node: id,
+            });
             Ok(id)
         })
     }
@@ -206,7 +210,7 @@ impl GraphStore {
     /// ```
     pub fn delete_node<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         id: NodeId,
     ) -> Result<(), GraphError> {
         batch.atomic(|batch| {
@@ -214,7 +218,12 @@ impl GraphStore {
             constraint::ensure_no_incident_edges(batch, self.namespace, id)?;
             property::clear_all(batch, self.namespace, Owner::Node(id))?;
             catalog::clear_labels(batch, self.namespace, id)?;
-            batch.put(keys::node(self.namespace, id), encode_tombstone())
+            batch.put(keys::node(self.namespace, id), encode_tombstone())?;
+            batch.record(GraphMutation::NodeDelete {
+                namespace: self.namespace,
+                node: id,
+            });
+            Ok(())
         })
     }
 
@@ -265,7 +274,7 @@ impl GraphStore {
     /// ```
     pub fn create_edge<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         source: NodeId,
         target: NodeId,
         edge_type: TypeId,
@@ -283,6 +292,13 @@ impl GraphStore {
             batch.put(keys::edge(self.namespace, id), encode_edge(&record))?;
             adjacency::link(batch, self.namespace, &record)?;
             index::note_edge(batch, self.namespace, &record)?;
+            batch.record(GraphMutation::EdgeCreate {
+                namespace: self.namespace,
+                edge: id,
+                source,
+                target,
+                edge_type,
+            });
             Ok(id)
         })
     }
@@ -368,7 +384,7 @@ impl GraphStore {
     /// ```
     pub fn delete_edge<V: Vfs>(
         &self,
-        batch: &mut GraphBatch<'_, V>,
+        batch: &mut GraphTxn<V>,
         id: EdgeId,
     ) -> Result<(), GraphError> {
         batch.atomic(|batch| {
@@ -376,7 +392,15 @@ impl GraphStore {
             adjacency::unlink(batch, self.namespace, &record)?;
             property::clear_all(batch, self.namespace, Owner::Edge(id))?;
             index::forget_edge(batch, self.namespace, &record)?;
-            batch.put(keys::edge(self.namespace, id), encode_tombstone())
+            batch.put(keys::edge(self.namespace, id), encode_tombstone())?;
+            batch.record(GraphMutation::EdgeDelete {
+                namespace: self.namespace,
+                edge: id,
+                source: record.source,
+                target: record.target,
+                edge_type: record.edge_type,
+            });
+            Ok(())
         })
     }
 }

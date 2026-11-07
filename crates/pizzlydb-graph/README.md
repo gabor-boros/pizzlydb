@@ -6,31 +6,31 @@ Graph records, adjacency, properties, indexes, and constraints stored as keys in
 
 `pizzlydb-graph` stores and validates the property graph of one namespace: node and edge records, catalog names, node labels, both adjacency directions, property cells and declarations, secondary indexes, and label and relationship-type membership. Every logical change is a set of puts and deletes on one storage write batch.
 
-The crate depends on `pizzlydb-core`, `pizzlydb-storage`, and `pizzlydb-txn`. It does not import the protocol or the server.
+The crate depends on `pizzlydb-core`, `pizzlydb-storage`, and `pizzlydb-txn`. It does not import the protocol or the server. Graph writes go through `GraphTxn` and do not call `Storage::begin_write`.
 
 ## Usage
 
-`GraphBatch::begin` takes the storage writer lock and reads the latest snapshot. Reads through the batch see its staged writes. `GraphBatch::commit` publishes the batch atomically; dropping it publishes nothing. A `GraphStore` call that returns an error stages nothing.
+`GraphTxn::begin` opens an optimistic transaction on the latest snapshot. Reads through the transaction see its staged writes. `GraphTxn::commit` validates and publishes the batch; dropping it publishes nothing. A `GraphStore` call that returns an error stages nothing.
 
 ```rust
 use std::path::Path;
 
 use pizzlydb_core::{LabelId, NamespaceId, TypeId};
-use pizzlydb_graph::{Direction, GraphBatch, GraphStore};
+use pizzlydb_graph::{Direction, GraphStore, GraphTxn};
 use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 
 let vfs = MemoryVfs::new();
 let storage = Storage::create(&vfs, Path::new("db"), 8, Durability::Full, |id| id.fill(1))?;
 let graph = GraphStore::new(NamespaceId::from_u128(1)?);
 
-let mut batch = GraphBatch::begin(&storage)?;
-let person: LabelId = graph.intern(&mut batch, "Person")?;
-let knows: TypeId = graph.intern(&mut batch, "KNOWS")?;
-let a = graph.create_node(&mut batch)?;
-let b = graph.create_node(&mut batch)?;
-graph.add_label(&mut batch, a, person)?;
-graph.create_edge(&mut batch, a, b, knows)?;
-batch.commit()?;
+let mut txn = GraphTxn::begin(&storage)?;
+let person: LabelId = graph.intern(&mut txn, "Person")?;
+let knows: TypeId = graph.intern(&mut txn, "KNOWS")?;
+let a = graph.create_node(&mut txn)?;
+let b = graph.create_node(&mut txn)?;
+graph.add_label(&mut txn, a, person)?;
+graph.create_edge(&mut txn, a, b, knows)?;
+txn.commit()?;
 
 let view = storage.snapshot()?;
 assert_eq!(graph.neighbors(&view, a, Direction::Out)?.count(), 1);

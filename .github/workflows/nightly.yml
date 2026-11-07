@@ -43,7 +43,7 @@ jobs:
           mkdir -p artifacts logs
           targets="page_header superblock wal_header wal_frame btree_node \
             overflow allocator bitmap retire_spill value key graph_record \
-            declaration index_definition engine"
+            declaration index_definition engine mutation"
           for target in ${targets}; do
             mkdir -p "artifacts/${target}"
             ./target/release/"${target}" "corpus/${target}" \

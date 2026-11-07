@@ -1,18 +1,16 @@
 //! Property graph stored as keys in the `pizzlydb-storage` ordered map.
 //!
-//! [`GraphStore`] reads and writes the keys of one namespace: node and edge
-//! records, catalog names, node labels, both adjacency directions, property
-//! cells and declarations, secondary indexes, and label and relationship-type
-//! membership. Reads take any [`KeyRead`]: a committed
-//! [`ReadView`](pizzlydb_storage::ReadView) or an open [`GraphBatch`]. Writes
-//! stage keys on a [`GraphBatch`], which reads its own staged writes and
-//! publishes them as one atomic storage batch on [`GraphBatch::commit`].
+//! [`GraphStore`] reads and writes the keys of one namespace. Reads take any
+//! [`KeyRead`]: a committed [`ReadView`](pizzlydb_storage::ReadView) or an open
+//! [`GraphTxn`]. Writes stage keys on a [`GraphTxn`]. Commit validates the
+//! transaction and publishes it as one atomic storage batch.
 //!
 //! [`verify_full`] checks that the keys of one namespace agree.
 //! [`salvage`] copies one namespace into a new database.
 //! [`bulk_load`] creates a database from a line-oriented script.
 //!
-//! This crate does not import protocol or server code.
+//! This crate does not import protocol or server code, and it does not call
+//! [`Storage::begin_write`](pizzlydb_storage::Storage::begin_write).
 //!
 //! # Examples
 //!
@@ -21,27 +19,27 @@
 //! use std::path::Path;
 //!
 //! use pizzlydb_core::{LabelId, NamespaceId, PropertyKeyId, TypeId, Value};
-//! use pizzlydb_graph::{Direction, GraphBatch, GraphStore, Owner, Scope};
+//! use pizzlydb_graph::{Direction, GraphStore, GraphTxn, Owner, Scope};
 //! use pizzlydb_storage::{Durability, MemoryVfs, Storage};
 //!
 //! let vfs = MemoryVfs::new();
 //! let storage = Storage::create(&vfs, Path::new("db"), 8, Durability::Full, |id| id.fill(1))?;
 //! let graph = GraphStore::new(NamespaceId::from_u128(1)?);
 //!
-//! let mut batch = GraphBatch::begin(&storage)?;
-//! let person: LabelId = graph.intern(&mut batch, "Person")?;
-//! let knows: TypeId = graph.intern(&mut batch, "KNOWS")?;
-//! let name: PropertyKeyId = graph.intern(&mut batch, "name")?;
-//! let by_name = graph.create_index(&mut batch, Scope::Label(person), name, true)?;
+//! let mut txn = GraphTxn::begin(&storage)?;
+//! let person: LabelId = graph.intern(&mut txn, "Person")?;
+//! let knows: TypeId = graph.intern(&mut txn, "KNOWS")?;
+//! let name: PropertyKeyId = graph.intern(&mut txn, "name")?;
+//! let by_name = graph.create_index(&mut txn, Scope::Label(person), name, true)?;
 //!
-//! let ada = graph.create_node(&mut batch)?;
-//! let alan = graph.create_node(&mut batch)?;
+//! let ada = graph.create_node(&mut txn)?;
+//! let alan = graph.create_node(&mut txn)?;
 //! for (node, text) in [(ada, "Alice"), (alan, "Alan")] {
-//!     graph.add_label(&mut batch, node, person)?;
-//!     graph.set_property(&mut batch, node, name, &Value::from(text))?;
+//!     graph.add_label(&mut txn, node, person)?;
+//!     graph.set_property(&mut txn, node, name, &Value::from(text))?;
 //! }
-//! graph.create_edge(&mut batch, ada, alan, knows)?;
-//! batch.commit()?;
+//! graph.create_edge(&mut txn, ada, alan, knows)?;
+//! txn.commit()?;
 //!
 //! let view = storage.snapshot()?;
 //! let found = graph.index_lookup(&view, by_name, &Value::from("Alice"))?.collect::<Result<Vec<_>, _>>()?;
@@ -72,7 +70,7 @@ mod verify;
 
 pub use access::{IdScan, KeyRead};
 pub use adjacency::{Direction, Neighbor, Neighbors};
-pub use batch::{BatchScan, GraphBatch};
+pub use batch::{GraphBatch, GraphScan, GraphTxn};
 pub use bulk::{LoadOptions, LoadReport, bulk_load};
 pub use catalog::{CatalogId, MAX_NAME_LEN};
 pub use error::GraphError;

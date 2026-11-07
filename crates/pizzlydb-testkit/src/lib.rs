@@ -21,12 +21,14 @@
 mod dataset;
 mod generate;
 mod harness;
+mod history;
 mod reference;
 mod report;
 
 pub use dataset::{Dataset, power_law_graph, social_graph, uniform_graph};
 pub use generate::{PROPERTY_STEPS, WorkloadBias, generate_history, history_strategy};
 pub use harness::{Divergence, Subject, minimize, run_history};
+pub use history::{AnomalyClass, Cycle, HistOp, HistTxn, find_anomaly};
 pub use reference::{
     Counters, DIR_IN, DIR_OUT, DeclFact, EdgeFact, GraphSnapshot, History, IndexFact, IndexHit,
     ModelScope, NAME_KEY, NAME_LABEL, NAME_TYPE, NeighborFact, OWNER_EDGE, OWNER_NODE, Operation,

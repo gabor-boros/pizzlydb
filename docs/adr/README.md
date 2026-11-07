@@ -14,10 +14,10 @@ An architecture decision record (ADR) freezes one architectural choice. Guide [Â
 | ADR | Decision | Status | Owner issues |
 | --- | --- | --- | --- |
 | [ADR-001](0001-rust-workspace-and-unsafe-policy.md) | Rust workspace, edition 2024, forbidden unsafe code, crate dependency direction | Accepted | [001](../roadmap/001-design-record-and-baseline-adrs.md) |
-| [ADR-002](0002-identity-and-value-model.md) | Identity, value types, key encoding, schema model | Reserved | [034](../roadmap/034-id-allocation-and-identity-policy.md), [040](../roadmap/040-type-system-and-value-model.md) |
+| [ADR-002](0002-identity-and-value-model.md) | Identity decided; value types open | Accepted (part 1) | [034](../roadmap/034-id-allocation-and-identity-policy.md), [040](../roadmap/040-type-system-and-value-model.md) |
 | [ADR-003](0003-page-engine-and-ordered-keys.md) | In-house page engine with graph data as ordered keys | Accepted | [001](../roadmap/001-design-record-and-baseline-adrs.md) |
-| [ADR-004](0004-transaction-isolation.md) | Transaction isolation, concurrency control, conflicts | Reserved | [030](../roadmap/030-adr-transaction-isolation-model.md) |
-| [ADR-005](0005-commit-sequence-and-mutation-log.md) | Logical mutation log and `CommitSeq` invariants | Reserved | [031](../roadmap/031-commit-sequence-and-commit-metadata.md), [032](../roadmap/032-logical-mutation-log.md) |
+| [ADR-004](0004-transaction-isolation.md) | Optimistic validation, strict serializability, physical as-of snapshots | Accepted | [030](../roadmap/030-adr-transaction-isolation-model.md) |
+| [ADR-005](0005-commit-sequence-and-mutation-log.md) | `CommitSeq`, commit record, logical mutation log, retention floors | Accepted | [031](../roadmap/031-commit-sequence-and-commit-metadata.md), [032](../roadmap/032-logical-mutation-log.md) |
 | [ADR-006](0006-query-language.md) | Query grammar, result multisets, path semantics | Reserved | [050](../roadmap/050-query-language-specification.md) |
 | [ADR-007](0007-incremental-execution-engine.md) | Incremental operators, retractions, plan lifecycle | Reserved | [060](../roadmap/060-adr-incremental-execution-engine.md) |
 | [ADR-008](0008-durable-subscriptions.md) | Subscription protocol, acknowledgement, replay, expiry | Reserved | [068](../roadmap/068-durable-subscriptions-core.md) |

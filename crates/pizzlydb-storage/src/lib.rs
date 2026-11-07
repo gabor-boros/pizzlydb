@@ -50,8 +50,9 @@ mod wal;
 pub use backup::{BackupReport, backup, export_checkpoint, publish, restore};
 pub use btree::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use engine::{
-    BatchLimits, CheckpointPolicy, Direction, Durability, LimitKind, RangeEstimate, ReadView, Scan,
-    Storage, StorageEngine, StorageError, WriteBatch, random_file_id, wal_path,
+    BatchLimits, CheckpointPolicy, CommitAck, Direction, Durability, LimitKind, RangeEstimate,
+    ReadView, Scan, SnapshotInfo, SnapshotKind, SnapshotLease, Storage, StorageEngine,
+    StorageError, WriteBatch, random_file_id, wal_path,
 };
 pub use inspect::{Damage, DamageReason, InspectReport, inspect};
 pub use page::{Lsn, PageId};

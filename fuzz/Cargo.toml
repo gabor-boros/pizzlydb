@@ -134,6 +134,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "mutation"
+path = "fuzz_targets/mutation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "panic_canary"
 path = "fuzz_targets/panic_canary.rs"
 test = false

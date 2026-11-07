@@ -31,7 +31,8 @@
 
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
 
@@ -280,7 +281,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
                 meta: vec![FrameMeta::empty(); frame_count],
                 by_page: HashMap::new(),
                 clock_hand: 0,
-                snapshots: Vec::new(),
+                snapshots: Vec::new(), // SnapshotReg entries; see [`SnapshotReg`].
                 next_snapshot_id: 1,
                 next_txn_id: 1,
                 committed_lsn,
@@ -328,22 +329,111 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     /// assert_eq!(pager.snapshot_lsn(), Lsn::new(1));
     /// ```
     pub fn snapshot(&self) -> SnapshotGuard<'_, M, W> {
-        let (id, lsn) = {
-            let mut state = self.state.lock().expect("pager");
-            let id = state.next_snapshot_id;
-            state.next_snapshot_id = state.next_snapshot_id.saturating_add(1);
-
-            let lsn = state.committed_lsn;
-            state.snapshots.push((id, lsn));
-
-            (id, lsn)
-        };
-
+        let (id, lsn, expired) = self.register(SnapshotSpec::unlimited());
         SnapshotGuard {
             pager: self,
             id,
             lsn,
+            expired,
         }
+    }
+
+    /// Register a snapshot held by an `Arc` so the guard does not borrow the pager.
+    pub fn snapshot_owned(self: &Arc<Self>, spec: SnapshotSpec) -> OwnedSnapshot<M, W> {
+        let (id, lsn, expired) = self.register(spec);
+        OwnedSnapshot {
+            pager: Arc::clone(self),
+            id,
+            lsn,
+            expired,
+        }
+    }
+
+    fn register(&self, spec: SnapshotSpec) -> (u64, Lsn, Arc<AtomicBool>) {
+        let mut state = self.state.lock().expect("pager");
+        let id = state.next_snapshot_id;
+        state.next_snapshot_id = state.next_snapshot_id.saturating_add(1);
+        let lsn = state.committed_lsn;
+        let expired = Arc::new(AtomicBool::new(false));
+        state.snapshots.push(SnapshotReg {
+            id,
+            lsn,
+            kind: spec.kind,
+            tag: spec.tag,
+            registered_ms: spec.now_ms,
+            max_age_ms: spec.max_age_ms,
+            expired: Arc::clone(&expired),
+        });
+        (id, lsn, expired)
+    }
+
+    /// Drop registrations whose age is past their limit.
+    ///
+    /// A dropped registration fails later reads. It does not change bytes already copied.
+    pub fn reap_snapshots(&self, now_ms: u64) -> usize {
+        let mut state = self.state.lock().expect("pager");
+        let before = state.snapshots.len();
+        state.snapshots.retain(|reg| {
+            let too_old = reg
+                .max_age_ms
+                .is_some_and(|max| now_ms.saturating_sub(reg.registered_ms) > max);
+            if too_old {
+                reg.expired.store(true, Ordering::Release);
+                false
+            } else {
+                true
+            }
+        });
+        before - state.snapshots.len()
+    }
+
+    /// Move the registration clock forward and replace the age limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::SnapshotNotFound`] when `id` is not registered.
+    pub fn renew_snapshot(
+        &self,
+        id: u64,
+        now_ms: u64,
+        max_age_ms: Option<u64>,
+    ) -> Result<(), PagerError> {
+        let mut state = self.state.lock().expect("pager");
+        let Some(reg) = state.snapshots.iter_mut().find(|reg| reg.id == id) else {
+            return Err(PagerError::SnapshotNotFound);
+        };
+        if reg.expired.load(Ordering::Acquire) {
+            return Err(PagerError::SnapshotNotFound);
+        }
+        reg.registered_ms = now_ms;
+        reg.max_age_ms = max_age_ms;
+        Ok(())
+    }
+
+    /// Holders currently pinning a sequence.
+    pub fn inspect_snapshots(&self, now_ms: u64) -> Vec<SnapshotInfo> {
+        let state = self.state.lock().expect("pager");
+        let oldest = state.snapshots.iter().map(|reg| reg.lsn).min();
+        let appended = state.wal.appended_bytes();
+        let pages =
+            u64::try_from(state.wal.page_ids(state.committed_lsn).len()).unwrap_or(u64::MAX);
+
+        state
+            .snapshots
+            .iter()
+            .map(|reg| {
+                let pins = oldest == Some(reg.lsn);
+                SnapshotInfo {
+                    id: reg.id,
+                    lsn: reg.lsn,
+                    age_ms: now_ms.saturating_sub(reg.registered_ms),
+                    kind: reg.kind,
+                    tag: reg.tag.clone(),
+                    pinned_wal_bytes: if pins { appended } else { 0 },
+                    pinned_wal_pages: if pins { pages } else { 0 },
+                }
+            })
+            .collect()
     }
 
     /// Pin the newest committed image of `page_id` visible at `lsn`.
@@ -543,7 +633,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
     #[must_use]
     pub fn snapshot_lsn(&self) -> Lsn {
         let state = self.state.lock().expect("pager");
-        let oldest = state.snapshots.iter().map(|(_, lsn)| *lsn).min();
+        let oldest = state.snapshots.iter().map(|reg| reg.lsn).min();
         oldest.unwrap_or_else(|| next_lsn(state.committed_lsn))
     }
 
@@ -811,7 +901,7 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
             .expect("pager")
             .snapshots
             .iter()
-            .map(|(_, lsn)| *lsn)
+            .map(|reg| reg.lsn)
             .min()
     }
 
@@ -1466,6 +1556,86 @@ pub struct SnapshotGuard<'a, M: VfsFile, W: VfsFile> {
     pager: &'a Pager<M, W>,
     id: u64,
     lsn: Lsn,
+    expired: Arc<AtomicBool>,
+}
+
+/// Snapshot registration that owns an [`Arc`] of the pager.
+pub struct OwnedSnapshot<M: VfsFile, W: VfsFile> {
+    pager: Arc<Pager<M, W>>,
+    id: u64,
+    lsn: Lsn,
+    expired: Arc<AtomicBool>,
+}
+
+/// Why a snapshot is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotKind {
+    /// A point query or a short read.
+    Query,
+    /// An open transaction.
+    Transaction,
+    /// Subscription bootstrap.
+    Bootstrap,
+    /// Online backup.
+    Backup,
+    /// Maintenance that is allowed a longer limit.
+    Maintenance,
+}
+
+/// How a new snapshot is labeled and aged.
+#[derive(Clone, Debug)]
+pub struct SnapshotSpec {
+    /// Holder class.
+    pub kind: SnapshotKind,
+    /// Caller tag, such as a session or lease id.
+    pub tag: String,
+    /// Registration time, in milliseconds of the storage clock.
+    pub now_ms: u64,
+    /// Age after which [`Pager::reap_snapshots`] drops the registration.
+    /// `None` keeps it until the guard drops.
+    pub max_age_ms: Option<u64>,
+}
+
+impl SnapshotSpec {
+    /// A snapshot with no age limit.
+    #[must_use]
+    pub fn unlimited() -> Self {
+        Self {
+            kind: SnapshotKind::Query,
+            tag: String::new(),
+            now_ms: 0,
+            max_age_ms: None,
+        }
+    }
+}
+
+/// One registered snapshot, for [`Pager::inspect_snapshots`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    /// Registration id.
+    pub id: u64,
+    /// Sequence the holder reads.
+    pub lsn: Lsn,
+    /// Milliseconds since registration, on the clock passed to inspect.
+    pub age_ms: u64,
+    /// Holder class.
+    pub kind: SnapshotKind,
+    /// Caller tag.
+    pub tag: String,
+    /// Appended log bytes pinned because this holder shares the oldest sequence.
+    pub pinned_wal_bytes: u64,
+    /// Log page images visible at the committed sequence when this holder is oldest.
+    pub pinned_wal_pages: u64,
+}
+
+struct SnapshotReg {
+    id: u64,
+    lsn: Lsn,
+    kind: SnapshotKind,
+    tag: String,
+    registered_ms: u64,
+    max_age_ms: Option<u64>,
+    expired: Arc<AtomicBool>,
 }
 
 impl<M: VfsFile, W: VfsFile> SnapshotGuard<'_, M, W> {
@@ -1505,15 +1675,46 @@ impl<M: VfsFile, W: VfsFile> SnapshotGuard<'_, M, W> {
     }
 }
 
+impl<M: VfsFile, W: VfsFile> OwnedSnapshot<M, W> {
+    /// Sequence captured at registration.
+    #[must_use]
+    pub const fn lsn(&self) -> Lsn {
+        self.lsn
+    }
+
+    /// Registration id.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// `true` after the registration was reaped.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
+    }
+}
+
 impl<M: VfsFile, W: VfsFile> Drop for SnapshotGuard<'_, M, W> {
     fn drop(&mut self) {
-        self.pager
-            .state
-            .lock()
-            .expect("pager")
-            .snapshots
-            .retain(|(id, _)| *id != self.id);
+        let _expired = self.expired.load(Ordering::Relaxed);
+        unregister(self.pager, self.id);
     }
+}
+
+impl<M: VfsFile, W: VfsFile> Drop for OwnedSnapshot<M, W> {
+    fn drop(&mut self) {
+        unregister(&self.pager, self.id);
+    }
+}
+
+fn unregister<M: VfsFile, W: VfsFile>(pager: &Pager<M, W>, id: u64) {
+    pager
+        .state
+        .lock()
+        .expect("pager")
+        .snapshots
+        .retain(|reg| reg.id != id);
 }
 
 struct State<M: VfsFile, W: VfsFile> {
@@ -1522,7 +1723,7 @@ struct State<M: VfsFile, W: VfsFile> {
     meta: Vec<FrameMeta>,
     by_page: HashMap<PageId, Vec<usize>>,
     clock_hand: usize,
-    snapshots: Vec<(u64, Lsn)>,
+    snapshots: Vec<SnapshotReg>,
     next_snapshot_id: u64,
     next_txn_id: u64,
     committed_lsn: Lsn,
@@ -1532,9 +1733,7 @@ struct State<M: VfsFile, W: VfsFile> {
 
 impl<M: VfsFile, W: VfsFile> State<M, W> {
     fn registered(&self, lsn: Lsn) -> bool {
-        self.snapshots
-            .iter()
-            .any(|(_, registered)| *registered == lsn)
+        self.snapshots.iter().any(|reg| reg.lsn == lsn)
     }
 
     fn find_cached(&self, page_id: PageId, snapshot: Lsn) -> Option<usize> {
