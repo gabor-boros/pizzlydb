@@ -55,6 +55,11 @@ assert_eq!(graph.neighbors(&view, a, Direction::Out)?.count(), 1);
 - `adjacency` — outgoing and incoming adjacency
 - `property` — property cells and declarations
 - `index` — secondary indexes and membership
+- `verify` — key checks for one namespace
+- `salvage` — copy one namespace into a new database
+- `bulk` — load a line-oriented script
+
+`verify_full` reads one snapshot and does not write. `salvage` copies committed records through the graph API; a hole or an omission shifts later identifiers of that kind. `bulk_load` applies commands by phase and publishes the database only after `verify_full` succeeds.
 
 ## License
 

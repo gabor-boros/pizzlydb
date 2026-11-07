@@ -275,6 +275,80 @@ pub trait Vfs {
     /// validates `directory` and then publishes every current file name; it has
     /// one directory.
     fn sync_dir(&self, directory: &Path) -> Result<(), VfsError>;
+
+    /// Move `from` to `to` for `role`, replacing `to` when it exists.
+    ///
+    /// The new name is visible to later opens. It survives [`MemoryVfs::crash`](crate::MemoryVfs::crash)
+    /// only after [`Self::sync_dir`]. Equal path strings are rejected. Paths are
+    /// not canonicalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::InvalidPath`] for an empty path, a NUL byte, or equal
+    /// paths, [`VfsError::NotFound`] when `from` is absent, and [`VfsError::Io`]
+    /// when a file is open or the rename fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsFile};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let mut file = vfs
+    ///     .open(
+    ///         Path::new("from"),
+    ///         FileRole::Main,
+    ///         &OpenOptions::new().create(true),
+    ///     )
+    ///     .unwrap();
+    /// file.write_all(0, b"page").unwrap();
+    /// file.sync().unwrap();
+    /// drop(file);
+    ///
+    /// vfs.rename(Path::new("from"), Path::new("to"), FileRole::Main)
+    ///     .unwrap();
+    /// let mut file = vfs
+    ///     .open(Path::new("to"), FileRole::Main, &OpenOptions::new())
+    ///     .unwrap();
+    /// let mut buf = [0; 4];
+    /// file.read_exact(0, &mut buf).unwrap();
+    /// assert_eq!(&buf, b"page");
+    /// ```
+    fn rename(&self, from: &Path, to: &Path, role: FileRole) -> Result<(), VfsError>;
+
+    /// Delete `path` for `role`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VfsError::NotFound`] when the path is absent,
+    /// [`VfsError::InvalidPath`] for an empty path or a NUL byte, and
+    /// [`VfsError::Io`] when the file is open or the delete fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use pizzlydb_storage::vfs::{FileRole, MemoryVfs, OpenOptions, Vfs, VfsError};
+    ///
+    /// let vfs = MemoryVfs::new();
+    /// let file = vfs
+    ///     .open(
+    ///         Path::new("db"),
+    ///         FileRole::Main,
+    ///         &OpenOptions::new().create(true),
+    ///     )
+    ///     .unwrap();
+    /// drop(file);
+    /// vfs.remove(Path::new("db"), FileRole::Main).unwrap();
+    /// let missing = vfs
+    ///     .open(Path::new("db"), FileRole::Main, &OpenOptions::new())
+    ///     .unwrap_err();
+    /// assert!(matches!(missing, VfsError::NotFound));
+    /// ```
+    fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError>;
 }
 
 /// One open file.
@@ -596,9 +670,9 @@ fn take_fault(state: &Rc<RefCell<FaultState>>) -> Result<Option<FaultKind>, VfsE
 /// Backend wrapper that fails calls selected by a script.
 ///
 /// Counted calls are 1-based and shared by the wrapper and the handles it
-/// returns: `open`, `read_at`, `write_at`, `sync`, `len`, `sync_dir`, and
-/// `close`. `read_exact` and `write_all` are not separate operations. [`Drop`]
-/// is not counted. [`VfsFile::role`] is not counted.
+/// returns: `open`, `read_at`, `write_at`, `sync`, `len`, `sync_dir`, `rename`,
+/// `remove`, and `close`. `read_exact` and `write_all` are not separate
+/// operations. [`Drop`] is not counted. [`VfsFile::role`] is not counted.
 ///
 /// [`FaultKind::Short`] limits `read_at` and `write_at`. [`FaultKind::Torn`]
 /// persists a prefix through `write_at` and then returns [`VfsError::Io`].
@@ -697,6 +771,22 @@ impl<V: Vfs> Vfs for FaultInjecting<V> {
         }
 
         self.inner.sync_dir(directory)
+    }
+
+    fn rename(&self, from: &Path, to: &Path, role: FileRole) -> Result<(), VfsError> {
+        if take_fault(&self.state)?.is_some() {
+            return Err(injected_fault());
+        }
+
+        self.inner.rename(from, to, role)
+    }
+
+    fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError> {
+        if take_fault(&self.state)?.is_some() {
+            return Err(injected_fault());
+        }
+
+        self.inner.remove(path, role)
     }
 }
 

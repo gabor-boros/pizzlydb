@@ -4,7 +4,11 @@
 //! committed sequence. [`Storage::begin_write`] stages puts and deletes.
 //! [`WriteBatch::commit`] with [`Durability::Full`] returns after the commit
 //! record is synced. Dropping a batch without `commit` publishes nothing.
-//! [`Storage::checkpoint`] copies committed bytes into the main file.
+//! [`Storage::checkpoint`] copies committed bytes into the main file and
+//! reclaims pages that no open snapshot can still read.
+//! [`backup`] copies one snapshot to a new database. [`restore`] replaces a
+//! path from that copy. [`verify_quick`] checks page headers and the tree.
+//! [`inspect`] reports the first damaged page in the main file.
 //!
 //! One write batch may be open. A second [`Storage::begin_write`] returns
 //! [`StorageError::Busy`].
@@ -42,9 +46,12 @@ pub mod vfs_posix;
 #[cfg_attr(not(test), allow(dead_code))]
 mod wal;
 
+pub use backup::{BackupReport, backup, export_checkpoint, publish, restore};
 pub use btree::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use engine::{Durability, ReadView, Scan, Storage, StorageEngine, StorageError, WriteBatch};
-pub use page::Lsn;
+pub use inspect::{Damage, DamageReason, InspectReport, inspect};
+pub use page::{Lsn, PageId};
+pub use verify::verify_quick;
 pub use vfs::{Fault, FaultInjecting, FaultKind, FileRole, OpenOptions, Vfs, VfsError, VfsFile};
 pub use vfs_memory::MemoryVfs;
 #[cfg(unix)]

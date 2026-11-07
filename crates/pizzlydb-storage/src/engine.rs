@@ -30,9 +30,11 @@ use crate::superblock::{self, Superblock, SuperblockError};
 use crate::vfs::{FileRole, OpenOptions, Vfs, VfsError, VfsFile, io_error};
 use crate::wal::{Wal, WalError};
 
+use crate::maintain;
+
 pub use crate::wal::Durability;
 
-const STATE_PAGE_ID: PageId = PageId::new(4);
+pub(crate) const STATE_PAGE_ID: PageId = PageId::new(4);
 const STATE_ROOT_OFFSET: usize = HEADER_SIZE;
 const STATE_HIGH_OFFSET: usize = HEADER_SIZE + 8;
 const STATE_BODY_END: usize = STATE_HIGH_OFFSET + 8;
@@ -367,7 +369,7 @@ impl<V: Vfs> Storage<V> {
         let snapshot = self.inner.pager.snapshot();
         Ok(ReadView {
             storage: self,
-            snapshot,
+            snapshot: Some(snapshot),
         })
     }
 
@@ -450,8 +452,11 @@ impl<V: Vfs> Storage<V> {
     /// Copy the oldest visible sequence into the main file.
     ///
     /// The sequence is the oldest open snapshot, or the committed sequence
-    /// when no snapshot is open. The log prefix covered by that sequence is
-    /// removed. An open snapshot still reads the same keys.
+    /// when no snapshot is open. Pages retired before the pager horizon are
+    /// reclaimed first. That bitmap is written into the main file only when
+    /// this checkpoint covers the committed sequence. The log prefix covered
+    /// by the checkpoint sequence is removed. An open snapshot still reads
+    /// the same keys.
     ///
     /// # Errors
     ///
@@ -487,12 +492,14 @@ impl<V: Vfs> Storage<V> {
         }
 
         self.inner.pager.sync_wal().map_err(map_pager)?;
+        let reclaimed = maintain::reclaim_to_horizon(self)?;
         let guard = self.inner.pager.snapshot();
         let visible = self
             .inner
             .pager
             .oldest_snapshot()
             .ok_or(StorageError::Corrupt)?;
+        let committed = self.inner.pager.committed_lsn();
 
         let state = read_page(&self.inner.pager, visible, STATE_PAGE_ID)?;
         let (root, high_water) = decode_state(&state)?;
@@ -503,6 +510,9 @@ impl<V: Vfs> Storage<V> {
             }
             let pin = self.inner.pager.pin(id, visible).map_err(map_pager)?;
             self.inner.pager.write_main(&pin).map_err(map_pager)?;
+        }
+        if reclaimed && visible == committed {
+            self.write_reclaimed_space(visible)?;
         }
         self.inner.pager.sync_main().map_err(map_pager)?;
 
@@ -592,6 +602,124 @@ impl<V: Vfs> Storage<V> {
             Ok(())
         }
     }
+
+    pub(crate) fn reclaim_horizon(&self) -> Result<bool, StorageError> {
+        if self.inner.db.borrow().closed {
+            return Ok(false);
+        }
+
+        let horizon = self.inner.pager.snapshot_lsn();
+        let mut db = self.inner.db.borrow_mut();
+        if db.closed {
+            return Ok(false);
+        }
+
+        let before = db.space.clone();
+        if let Err(err) = db.space.reclaim(horizon) {
+            db.closed = true;
+            return Err(map_space(err));
+        }
+
+        Ok(db.space != before)
+    }
+
+    fn write_reclaimed_space(&self, lsn: Lsn) -> Result<(), StorageError> {
+        let encoded = self.inner.db.borrow().space.encode();
+        let mut header = encoded.header;
+        let mut bitmap = encoded.bitmap;
+        stamp(&mut header, lsn)?;
+        stamp(&mut bitmap, lsn)?;
+        self.inner
+            .pager
+            .write_page(ALLOCATOR_PAGE_ID, &header)
+            .map_err(map_pager)?;
+        self.inner
+            .pager
+            .write_page(BITMAP_PAGE_ID, &bitmap)
+            .map_err(map_pager)?;
+
+        for spill in encoded.spills {
+            let mut bytes = spill.bytes;
+            stamp(&mut bytes, lsn)?;
+            self.inner
+                .pager
+                .write_page(spill.page_id, &bytes)
+                .map_err(map_pager)?;
+        }
+
+        Ok(())
+    }
+
+    /// Page image visible at `lsn`. `lsn` must be a registered snapshot.
+    pub(crate) fn page_image(&self, lsn: Lsn, id: PageId) -> Result<[u8; PAGE_SIZE], StorageError> {
+        self.inner.pager.read_image(id, lsn).map_err(map_pager)
+    }
+
+    pub(crate) fn main_len(&self) -> Result<u64, StorageError> {
+        self.inner.pager.main_len().map_err(map_pager)
+    }
+
+    pub(crate) fn logical_pages(&self) -> u64 {
+        self.inner.db.borrow().superblock.logical_page_count()
+    }
+
+    pub(crate) fn file_identity(&self) -> [u8; 16] {
+        self.inner.db.borrow().superblock.file_id()
+    }
+
+    pub(crate) fn superblock_slots(&self) -> (PageId, PageId) {
+        let db = self.inner.db.borrow();
+        (
+            db.superblock.allocator_page_id(),
+            db.superblock.free_space_map_page_id(),
+        )
+    }
+
+    pub(crate) fn committed_space(&self) -> Space {
+        self.inner.db.borrow().space.clone()
+    }
+
+    pub(crate) fn verify_tree(
+        &self,
+        lsn: Lsn,
+        root: PageId,
+        space: &Space,
+    ) -> Result<(), StorageError> {
+        let pages = AllocatedPages {
+            inner: SnapshotPages {
+                pager: &self.inner.pager,
+                lsn,
+            },
+            space,
+        };
+        BTree::from_root(root).verify(&pages).map_err(map_tree)
+    }
+
+    #[cfg(test)]
+    fn is_page_allocated(&self, id: PageId) -> bool {
+        self.inner.db.borrow().space.is_allocated(id)
+    }
+
+    #[cfg(test)]
+    fn retired_pages(&self) -> Vec<PageId> {
+        let space = &self.inner.db.borrow().space;
+        (0..space.high_water())
+            .map(PageId::new)
+            .filter(|id| space.is_retired(*id))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn reuse_candidate(&self, retired: &[PageId]) -> Option<PageId> {
+        let mut space = self.inner.db.borrow().space.clone();
+        for _ in 0..space.high_water() {
+            let id = space.allocate(PageKind::BTreeLeaf).ok()?;
+            if retired.contains(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 impl<V: Vfs> StorageEngine for Storage<V> {
@@ -650,7 +778,7 @@ impl<V: Vfs> StorageEngine for Storage<V> {
 #[must_use = "dropping the view releases its snapshot"]
 pub struct ReadView<'a, V: Vfs> {
     storage: &'a Storage<V>,
-    snapshot: SnapshotGuard<'a, V::File, V::File>,
+    snapshot: Option<SnapshotGuard<'a, V::File, V::File>>,
 }
 
 impl<'a, V: Vfs> ReadView<'a, V> {
@@ -673,7 +801,7 @@ impl<'a, V: Vfs> ReadView<'a, V> {
     /// ```
     #[must_use]
     pub fn sequence(&self) -> Lsn {
-        self.snapshot.lsn()
+        self.registered().lsn()
     }
 
     /// Copy the value stored at `key`, or [`None`] when it is absent.
@@ -762,10 +890,16 @@ impl<'a, V: Vfs> ReadView<'a, V> {
         self.storage.ensure_open()
     }
 
+    fn registered(&self) -> &SnapshotGuard<'_, V::File, V::File> {
+        self.snapshot
+            .as_ref()
+            .expect("snapshot is registered until the view is dropped")
+    }
+
     fn lookup_root(&self) -> Result<PageId, StorageError> {
         let image = read_page(
             &self.storage.inner.pager,
-            self.snapshot.lsn(),
+            self.registered().lsn(),
             STATE_PAGE_ID,
         )?;
 
@@ -776,8 +910,15 @@ impl<'a, V: Vfs> ReadView<'a, V> {
     fn pages(&self) -> SnapshotPages<'_, V::File, V::File> {
         SnapshotPages {
             pager: &self.storage.inner.pager,
-            lsn: self.snapshot.lsn(),
+            lsn: self.registered().lsn(),
         }
+    }
+}
+
+impl<V: Vfs> Drop for ReadView<'_, V> {
+    fn drop(&mut self) {
+        self.snapshot.take();
+        let _ = maintain::reclaim_to_horizon(self.storage);
     }
 }
 
@@ -1044,6 +1185,31 @@ impl<V: Vfs> Drop for WriteBatch<V> {
         // lock is released. The published map is left in place.
         let _published = self.committed;
         self.inner.db.borrow_mut().writer = false;
+    }
+}
+
+fn stamp(image: &mut [u8; PAGE_SIZE], lsn: Lsn) -> Result<(), StorageError> {
+    put_u64(image, LSN_OFFSET, lsn.as_u64()).map_err(|_| StorageError::Corrupt)?;
+    seal(image).map_err(|_| StorageError::Corrupt)?;
+    Ok(())
+}
+
+struct AllocatedPages<'a, M: VfsFile, W: VfsFile> {
+    inner: SnapshotPages<'a, M, W>,
+    space: &'a Space,
+}
+
+impl<M: VfsFile, W: VfsFile> PageRead for AllocatedPages<'_, M, W> {
+    type Pin<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn pin(&self, id: PageId) -> Result<Self::Pin<'_>, TreeError> {
+        if !self.space.is_allocated(id) {
+            return Err(TreeError::Corrupt);
+        }
+        self.inner.pin(id)
     }
 }
 
@@ -1317,7 +1483,7 @@ fn encode_state(root: PageId, high_water: u64, lsn: Lsn) -> Result<[u8; PAGE_SIZ
     Ok(page)
 }
 
-fn decode_state(page: &[u8]) -> Result<(PageId, u64), StorageError> {
+pub(crate) fn decode_state(page: &[u8]) -> Result<(PageId, u64), StorageError> {
     if page.len() != PAGE_SIZE {
         return Err(StorageError::Corrupt);
     }
@@ -1343,7 +1509,7 @@ fn offset_of(id: PageId) -> Result<u64, StorageError> {
         .ok_or(StorageError::Corrupt)
 }
 
-fn wal_path(path: &Path) -> PathBuf {
+pub(crate) fn wal_path(path: &Path) -> PathBuf {
     let Some(name) = path.file_name() else {
         return path.to_path_buf();
     };
@@ -1356,7 +1522,7 @@ fn wal_path(path: &Path) -> PathBuf {
     out
 }
 
-fn parent_dir(path: &Path) -> &Path {
+pub(crate) fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -1385,7 +1551,7 @@ fn map_tree(err: TreeError) -> StorageError {
     }
 }
 
-fn map_pager(err: PagerError) -> StorageError {
+pub(crate) fn map_pager(err: PagerError) -> StorageError {
     match err {
         PagerError::Io(err) => StorageError::Io(err),
         PagerError::Wal(err) => map_wal(err),
@@ -1398,7 +1564,7 @@ fn map_pager(err: PagerError) -> StorageError {
     }
 }
 
-fn map_wal(err: WalError) -> StorageError {
+pub(crate) fn map_wal(err: WalError) -> StorageError {
     match err {
         WalError::Io(err) => StorageError::Io(err),
         WalError::UnsupportedVersion => StorageError::UnsupportedVersion,
@@ -1410,7 +1576,7 @@ fn map_wal(err: WalError) -> StorageError {
     }
 }
 
-fn map_super(err: SuperblockError) -> StorageError {
+pub(crate) fn map_super(err: SuperblockError) -> StorageError {
     match err {
         SuperblockError::Io(err) => StorageError::Io(err),
         SuperblockError::UnsupportedVersion => StorageError::UnsupportedVersion,
@@ -1440,5 +1606,43 @@ mod tests {
     fn wal_path_appends_suffix_to_the_file_name() {
         assert_eq!(wal_path(Path::new("db")), Path::new("db-wal"));
         assert_eq!(wal_path(Path::new("dir/db")), Path::new("dir/db-wal"));
+    }
+
+    #[test]
+    fn held_snapshot_blocks_reclaim_until_it_drops() {
+        use super::Storage;
+        use crate::Durability;
+        use crate::vfs_memory::MemoryVfs;
+
+        let vfs = MemoryVfs::new();
+        let db = Storage::create(&vfs, Path::new("reclaim"), 8, Durability::Full, |id| {
+            id.fill(1);
+        })
+        .unwrap();
+        let blob = vec![9_u8; 20_000];
+        let mut batch = db.begin_write().unwrap();
+        batch.put(b"k", &blob).unwrap();
+        batch.commit(Durability::Full).unwrap();
+
+        let view = db.snapshot().unwrap();
+        let mut batch = db.begin_write().unwrap();
+        batch.delete(b"k").unwrap();
+        batch.commit(Durability::Full).unwrap();
+
+        let retired = db.retired_pages();
+        assert!(!retired.is_empty());
+        db.checkpoint().unwrap();
+        assert_eq!(view.get(b"k").unwrap().as_deref(), Some(blob.as_slice()));
+        for id in &retired {
+            assert!(db.is_page_allocated(*id));
+        }
+        assert!(db.reuse_candidate(&retired).is_none());
+
+        drop(view);
+        for id in &retired {
+            assert!(!db.is_page_allocated(*id));
+        }
+        assert!(db.reuse_candidate(&retired).is_some());
+        assert!(db.snapshot().unwrap().get(b"k").unwrap().is_none());
     }
 }

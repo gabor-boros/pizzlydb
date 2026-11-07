@@ -105,6 +105,29 @@ impl Vfs for PosixVfs {
         retry_io(|| file.sync_all()).map_err(map_io)?;
         Ok(())
     }
+
+    fn rename(&self, from: &Path, to: &Path, _role: FileRole) -> Result<(), VfsError> {
+        validate_path(from)?;
+        validate_path(to)?;
+        if from == to {
+            return Err(VfsError::InvalidPath);
+        }
+
+        match std::fs::rename(from, to) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Err(VfsError::NotFound),
+            Err(err) => Err(map_io(err)),
+        }
+    }
+
+    fn remove(&self, path: &Path, _role: FileRole) -> Result<(), VfsError> {
+        validate_path(path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Err(VfsError::NotFound),
+            Err(err) => Err(map_io(err)),
+        }
+    }
 }
 
 /// One filesystem descriptor.

@@ -247,6 +247,44 @@ pub(crate) fn index_entries(namespace: NamespaceId, index: IndexId, unique: bool
     key.into_vec()
 }
 
+pub(crate) fn node_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, NODE).into_vec()
+}
+
+pub(crate) fn edge_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, EDGE).into_vec()
+}
+
+pub(crate) fn adjacency_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, ADJACENCY).into_vec()
+}
+
+pub(crate) fn node_label_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, NODE_LABEL).into_vec()
+}
+
+pub(crate) fn label_member_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, LABEL_MEMBER).into_vec()
+}
+
+pub(crate) fn type_member_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, TYPE_MEMBER).into_vec()
+}
+
+pub(crate) fn declaration_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, DECLARATION).into_vec()
+}
+
+pub(crate) fn index_keys(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, INDEX_DEFINITION).into_vec()
+}
+
+pub(crate) fn name_id_keys(namespace: NamespaceId, id_kind: u8) -> Vec<u8> {
+    let mut key = KeyBuf::new(namespace, NAME_BY_ID);
+    key.push_u8(id_kind);
+    key.into_vec()
+}
+
 /// Append the key format of `value` to `key`.
 pub(crate) fn push_value(key: &mut Vec<u8>, value: &Value) -> Result<(), GraphError> {
     pizzlydb_core::encode_value_key(value, key).map_err(invalid_value)

@@ -68,6 +68,9 @@ pub enum GraphError {
     /// Stored graph bytes failed to decode.
     #[error("stored graph data is corrupt")]
     Corrupt,
+    /// A stored key does not match the record it names.
+    #[error("graph verification failed")]
+    VerificationFailed,
     /// The storage engine failed.
     #[error(transparent)]
     Storage(#[from] StorageError),

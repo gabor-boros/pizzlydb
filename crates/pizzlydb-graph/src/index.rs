@@ -712,19 +712,29 @@ fn remove_entry<V: Vfs>(
     batch.delete(entry_key(namespace, target, owner, value)?)
 }
 
+pub(crate) fn index_entry_key(
+    namespace: NamespaceId,
+    index: IndexId,
+    unique: bool,
+    owner: Owner,
+    value: &Value,
+) -> Result<Vec<u8>, GraphError> {
+    let mut key = keys::index_entries(namespace, index, unique);
+    keys::push_value(&mut key, value)?;
+    if !unique {
+        key.extend_from_slice(owner.id_bytes());
+    }
+
+    Ok(key)
+}
+
 fn entry_key(
     namespace: NamespaceId,
     target: &Target,
     owner: Owner,
     value: &Value,
 ) -> Result<Vec<u8>, GraphError> {
-    let mut key = keys::index_entries(namespace, target.index, target.unique);
-    keys::push_value(&mut key, value)?;
-    if !target.unique {
-        key.extend_from_slice(owner.id_bytes());
-    }
-
-    Ok(key)
+    index_entry_key(namespace, target.index, target.unique, owner, value)
 }
 
 /// Scopes that contain `owner`: a node's labels, or an edge's type.

@@ -592,7 +592,7 @@ fn change_labels<V: Vfs>(
     index::sync_labels(batch, namespace, node, removed, added)
 }
 
-fn valid_name(name: &[u8]) -> Result<&[u8], GraphError> {
+pub(crate) fn valid_name(name: &[u8]) -> Result<&[u8], GraphError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && !name.contains(&0)

@@ -8,6 +8,10 @@
 //! stage keys on a [`GraphBatch`], which reads its own staged writes and
 //! publishes them as one atomic storage batch on [`GraphBatch::commit`].
 //!
+//! [`verify_full`] checks that the keys of one namespace agree.
+//! [`salvage`] copies one namespace into a new database.
+//! [`bulk_load`] creates a database from a line-oriented script.
+//!
 //! This crate does not import protocol or server code.
 //!
 //! # Examples
@@ -51,6 +55,7 @@
 mod access;
 mod adjacency;
 mod batch;
+mod bulk;
 mod catalog;
 mod constraint;
 mod directory;
@@ -60,13 +65,18 @@ mod keys;
 mod property;
 mod record;
 mod record_store;
+mod salvage;
+mod verify;
 
 pub use access::{IdScan, KeyRead};
 pub use adjacency::{Direction, Neighbor, Neighbors};
 pub use batch::{BatchScan, GraphBatch};
+pub use bulk::{LoadOptions, LoadReport, bulk_load};
 pub use catalog::{CatalogId, MAX_NAME_LEN};
 pub use error::GraphError;
 pub use index::{IndexDefinition, IndexScan};
 pub use property::{Owner, PropertyDeclaration, Scope};
 pub use record::{EdgeRecord, NodeRecord};
 pub use record_store::GraphStore;
+pub use salvage::{Omission, OmissionKind, OmissionReason, SalvageReport, salvage};
+pub use verify::verify_full;

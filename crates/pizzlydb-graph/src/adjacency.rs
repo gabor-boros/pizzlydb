@@ -34,7 +34,7 @@ pub enum Direction {
 }
 
 impl Direction {
-    const fn byte(self) -> u8 {
+    pub(crate) const fn byte(self) -> u8 {
         match self {
             Self::Out => 1,
             Self::In => 2,

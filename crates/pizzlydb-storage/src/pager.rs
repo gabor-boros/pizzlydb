@@ -755,6 +755,48 @@ impl<M: VfsFile, W: VfsFile> Pager<M, W> {
         self.state.borrow().committed_lsn
     }
 
+    /// Bytes of `page_id` visible at `snapshot`, without checking the header.
+    ///
+    /// A log image wins over the main file. The caller registers `snapshot`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::SnapshotNotFound`] when `snapshot` is not
+    /// registered, and [`PagerError::Io`] when the main file cannot be read.
+    pub(crate) fn read_image(
+        &self,
+        page_id: PageId,
+        snapshot: Lsn,
+    ) -> Result<[u8; PAGE_SIZE], PagerError> {
+        let from_log = {
+            let state = self.state.borrow();
+            if !state.registered(snapshot) {
+                return Err(PagerError::SnapshotNotFound);
+            }
+            state.wal_image(page_id, snapshot)?
+        };
+        if let Some(bytes) = from_log {
+            return Ok(bytes);
+        }
+
+        let offset = page_offset(page_id)?;
+        let mut bytes = [0u8; PAGE_SIZE];
+        self.state
+            .borrow_mut()
+            .main
+            .read_exact(offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Length of the main file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PagerError::Io`] when the length cannot be read.
+    pub(crate) fn main_len(&self) -> Result<u64, PagerError> {
+        Ok(self.state.borrow().main.len()?)
+    }
+
     /// Oldest registered snapshot, if any guard is alive.
     #[must_use]
     pub(crate) fn oldest_snapshot(&self) -> Option<Lsn> {

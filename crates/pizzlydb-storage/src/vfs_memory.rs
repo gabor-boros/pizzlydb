@@ -43,8 +43,17 @@ impl MemFile {
 }
 
 #[derive(Debug)]
+struct PendingRename {
+    from: (PathBuf, FileRole),
+    to: (PathBuf, FileRole),
+    replaced: Option<MemFile>,
+}
+
+#[derive(Debug)]
 struct MemoryState {
     files: HashMap<(PathBuf, FileRole), MemFile>,
+    /// Renames undone by [`MemoryVfs::crash`] until [`Vfs::sync_dir`].
+    pending: Vec<PendingRename>,
     /// Bumped by [`MemoryVfs::crash`]. Handles store the value from `open`.
     generation: u64,
 }
@@ -100,6 +109,7 @@ impl MemoryVfs {
         Self {
             state: Rc::new(RefCell::new(MemoryState {
                 files: HashMap::new(),
+                pending: Vec::new(),
                 generation: 0,
             })),
         }
@@ -142,6 +152,10 @@ impl MemoryVfs {
     pub fn crash(&self) {
         let mut state = self.state.borrow_mut();
         state.generation = state.generation.wrapping_add(1);
+        let pending = std::mem::take(&mut state.pending);
+        for op in pending.into_iter().rev() {
+            undo_rename(&mut state.files, op);
+        }
 
         let previous = std::mem::take(&mut state.files);
         for (key, file) in previous {
@@ -188,16 +202,7 @@ impl MemoryVfs {
     /// vfs.remove(Path::new("db"), FileRole::Main).unwrap();
     /// ```
     pub fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError> {
-        let key = file_key(path, role)?;
-
-        let mut state = self.state.borrow_mut();
-        let open_count = state.files.get(&key).ok_or(VfsError::NotFound)?.open_count;
-        if open_count > 0 {
-            return Err(io_error("file is open"));
-        }
-
-        state.files.remove(&key);
-        Ok(())
+        Vfs::remove(self, path, role)
     }
 
     /// Replace both the visible and durable bytes of an existing file.
@@ -261,6 +266,34 @@ fn file_key(path: &Path, role: FileRole) -> Result<(PathBuf, FileRole), VfsError
     Ok((path.to_path_buf(), role))
 }
 
+fn invert_rename(
+    files: &mut HashMap<(PathBuf, FileRole), MemFile>,
+    op: PendingRename,
+) -> Result<(), Box<(VfsError, PendingRename)>> {
+    let Some(moved) = files.remove(&op.to) else {
+        return Err(Box::new((VfsError::NotFound, op)));
+    };
+    if moved.open_count > 0 {
+        files.insert(op.to.clone(), moved);
+        return Err(Box::new((io_error("file is open"), op)));
+    }
+
+    files.insert(op.from, moved);
+    if let Some(old) = op.replaced {
+        files.insert(op.to, old);
+    }
+    Ok(())
+}
+
+fn undo_rename(files: &mut HashMap<(PathBuf, FileRole), MemFile>, op: PendingRename) {
+    if let Some(moved) = files.remove(&op.to) {
+        files.insert(op.from, moved);
+    }
+    if let Some(old) = op.replaced {
+        files.insert(op.to, old);
+    }
+}
+
 impl Vfs for MemoryVfs {
     type File = MemoryFile;
 
@@ -308,7 +341,65 @@ impl Vfs for MemoryVfs {
         for file in state.files.values_mut() {
             file.published = true;
         }
+        state.pending.clear();
 
+        Ok(())
+    }
+
+    fn rename(&self, from: &Path, to: &Path, role: FileRole) -> Result<(), VfsError> {
+        let from_key = file_key(from, role)?;
+        let to_key = file_key(to, role)?;
+        if from_key.0 == to_key.0 {
+            return Err(VfsError::InvalidPath);
+        }
+
+        let mut state = self.state.borrow_mut();
+        if let Some(op) = state.pending.last()
+            && op.from == to_key
+            && op.to == from_key
+        {
+            let op = state.pending.pop().expect("pending rename is present");
+            if let Err(failed) = invert_rename(&mut state.files, op) {
+                let (err, op) = *failed;
+                state.pending.push(op);
+                return Err(err);
+            }
+            return Ok(());
+        }
+
+        let file = state.files.remove(&from_key).ok_or(VfsError::NotFound)?;
+        if file.open_count > 0 {
+            state.files.insert(from_key, file);
+            return Err(io_error("file is open"));
+        }
+
+        let replaced = match state.files.remove(&to_key) {
+            Some(dest) if dest.open_count > 0 => {
+                state.files.insert(to_key, dest);
+                state.files.insert(from_key, file);
+                return Err(io_error("file is open"));
+            }
+            other => other,
+        };
+
+        state.files.insert(to_key.clone(), file);
+        state.pending.push(PendingRename {
+            from: from_key,
+            to: to_key,
+            replaced,
+        });
+        Ok(())
+    }
+
+    fn remove(&self, path: &Path, role: FileRole) -> Result<(), VfsError> {
+        let key = file_key(path, role)?;
+        let mut state = self.state.borrow_mut();
+        let open_count = state.files.get(&key).ok_or(VfsError::NotFound)?.open_count;
+        if open_count > 0 {
+            return Err(io_error("file is open"));
+        }
+
+        state.files.remove(&key);
         Ok(())
     }
 }
@@ -758,5 +849,43 @@ mod tests {
         assert_eq!(read_vec(&mut file), b"\0\0x");
         file.write_all(1, b"yz").unwrap();
         assert_eq!(read_vec(&mut file), b"\0yz");
+    }
+
+    #[test]
+    fn rename_is_undone_by_crash_until_sync_dir() {
+        let vfs = MemoryVfs::new();
+        let mut file = vfs
+            .open(Path::new("old"), FileRole::Main, &create())
+            .unwrap();
+        file.write_all(0, b"keep").unwrap();
+        file.sync().unwrap();
+        drop(file);
+
+        vfs.rename(Path::new("old"), Path::new("new"), FileRole::Main)
+            .unwrap();
+        vfs.crash();
+        let mut file = vfs
+            .open(Path::new("old"), FileRole::Main, &OpenOptions::new())
+            .unwrap();
+        assert_eq!(read_vec(&mut file), b"keep");
+        drop(file);
+        let missing = vfs
+            .open(Path::new("new"), FileRole::Main, &OpenOptions::new())
+            .unwrap_err();
+        assert!(matches!(missing, VfsError::NotFound));
+
+        vfs.rename(Path::new("old"), Path::new("new"), FileRole::Main)
+            .unwrap();
+        vfs.sync_dir(Path::new(".")).unwrap();
+        vfs.crash();
+        let mut file = vfs
+            .open(Path::new("new"), FileRole::Main, &OpenOptions::new())
+            .unwrap();
+        assert_eq!(read_vec(&mut file), b"keep");
+        drop(file);
+        let missing = vfs
+            .open(Path::new("old"), FileRole::Main, &OpenOptions::new())
+            .unwrap_err();
+        assert!(matches!(missing, VfsError::NotFound));
     }
 }
