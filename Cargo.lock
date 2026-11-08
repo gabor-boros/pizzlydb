@@ -449,28 +449,28 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pizzlydb-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
 ]
 
 [[package]]
 name = "pizzlydb-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-sdk",
 ]
 
 [[package]]
 name = "pizzlydb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "pizzlydb-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "pizzlydb-core",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-incremental"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-query",
@@ -492,14 +492,14 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
 ]
 
 [[package]]
 name = "pizzlydb-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-graph",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-protocol",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-auth",
  "pizzlydb-graph",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "criterion",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-subscriptions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-incremental",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "proptest",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "pizzlydb-txn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pizzlydb-core",
  "pizzlydb-storage",
