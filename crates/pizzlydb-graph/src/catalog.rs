@@ -21,6 +21,7 @@ use crate::directory;
 use crate::error::GraphError;
 use crate::index;
 use crate::keys::{self, id_kind};
+use crate::property::Owner;
 use crate::record_store::GraphStore;
 
 /// Maximum name length in bytes.
@@ -137,6 +138,7 @@ impl GraphStore {
                 id: *id.as_bytes(),
                 name: name.to_vec(),
             });
+            crate::schema::touch_catalog(batch, self.namespace())?;
             Ok(id)
         })
     }
@@ -291,6 +293,7 @@ impl GraphStore {
                 previous: current.into_bytes(),
                 name: name.to_vec(),
             });
+            crate::schema::touch_rename(batch, self.namespace())?;
             Ok(())
         })
     }
@@ -613,7 +616,9 @@ fn change_labels<V: Vfs>(
         });
     }
 
-    index::sync_labels(batch, namespace, node, removed, added)
+    index::sync_labels(batch, namespace, node, removed, added)?;
+    batch.note_owner(namespace, Owner::Node(node));
+    Ok(())
 }
 
 pub(crate) fn valid_name(name: &[u8]) -> Result<&[u8], GraphError> {

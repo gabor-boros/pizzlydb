@@ -12,6 +12,9 @@
 //! | 4 | `floor` + id | durable retention floor |
 //! | 5 | `id` + namespace + kind | reserved id high-water, two `u128`s |
 //! | 6 | `format` | graph logical format version, `u16` |
+//! | 7 | `ns` + id | namespace registry record |
+//! | 8 | `ns_by_name` + name | namespace id |
+//! | 9 | `stat` + namespace + code + optional id | counter or sample |
 
 use pizzlydb_core::CommitSeq;
 
@@ -96,4 +99,56 @@ pub(crate) fn id_key(namespace: &[u8; 16], kind: u8) -> Vec<u8> {
 
 pub(crate) fn format_key() -> Vec<u8> {
     system_key(KIND_FORMAT, &[])
+}
+
+pub(crate) const KIND_NAMESPACE: u8 = 7;
+pub(crate) const KIND_NAMESPACE_NAME: u8 = 8;
+pub(crate) const KIND_STAT: u8 = 9;
+
+/// `sys/ns/<id>`.
+#[must_use]
+pub fn namespace_record_key(id: &[u8; 16]) -> Vec<u8> {
+    system_key(KIND_NAMESPACE, id)
+}
+
+/// Prefix of every namespace record.
+#[must_use]
+pub fn namespace_record_prefix() -> Vec<u8> {
+    system_key(KIND_NAMESPACE, &[])
+}
+
+/// Exclusive end of the namespace record range.
+#[must_use]
+pub fn namespace_record_end() -> Vec<u8> {
+    system_key(KIND_NAMESPACE.saturating_add(1), &[])
+}
+
+/// `sys/ns_by_name/<name>`.
+#[must_use]
+pub fn namespace_name_key(name: &[u8]) -> Vec<u8> {
+    system_key(KIND_NAMESPACE_NAME, name)
+}
+
+/// Prefix of the namespace name index.
+#[must_use]
+pub fn namespace_name_prefix() -> Vec<u8> {
+    system_key(KIND_NAMESPACE_NAME, &[])
+}
+
+/// `sys/stat/<namespace>/<code>` plus an optional 16-byte id.
+#[must_use]
+pub fn stat_key(namespace: &[u8; 16], code: u8, id: Option<&[u8; 16]>) -> Vec<u8> {
+    let mut rest = Vec::with_capacity(17 + id.map_or(0, |_| 16));
+    rest.extend_from_slice(namespace);
+    rest.push(code);
+    if let Some(id) = id {
+        rest.extend_from_slice(id);
+    }
+    system_key(KIND_STAT, &rest)
+}
+
+/// Prefix of every statistic for `namespace`.
+#[must_use]
+pub fn stat_prefix(namespace: &[u8; 16]) -> Vec<u8> {
+    system_key(KIND_STAT, namespace)
 }

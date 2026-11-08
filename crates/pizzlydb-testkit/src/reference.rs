@@ -283,6 +283,8 @@ pub enum Operation {
         value_type: ValueType,
         /// Whether null is accepted.
         nullable: bool,
+        /// Whether the property must be present.
+        required: bool,
     },
     /// Create an index, or return the existing identical index.
     CreateIndex {
@@ -379,7 +381,7 @@ pub struct EdgeFact {
 /// use pizzlydb_core::ValueType;
 /// use pizzlydb_testkit::DeclFact;
 ///
-/// let decl = DeclFact { type_tag: ValueType::Int.tag(), nullable: false };
+/// let decl = DeclFact { type_tag: ValueType::Int.tag(), nullable: false, required: false };
 /// assert_eq!(decl.type_tag, ValueType::Int.tag());
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -388,6 +390,8 @@ pub struct DeclFact {
     pub type_tag: u8,
     /// Whether null is accepted.
     pub nullable: bool,
+    /// Whether the property must be present.
+    pub required: bool,
 }
 
 /// Index definition.
@@ -599,6 +603,7 @@ struct IndexState {
 struct Decl {
     type_tag: u8,
     nullable: bool,
+    required: bool,
 }
 
 impl Ns {
@@ -800,6 +805,7 @@ impl ReferenceGraph {
                     DeclFact {
                         type_tag: decl.type_tag,
                         nullable: decl.nullable,
+                        required: decl.required,
                     },
                 );
             }
@@ -903,7 +909,8 @@ impl ReferenceGraph {
                 key,
                 value_type,
                 nullable,
-            } => self.declare(*namespace, *scope, *key, *value_type, *nullable),
+                required,
+            } => self.declare(*namespace, *scope, *key, *value_type, *nullable, *required),
             Operation::CreateIndex {
                 namespace,
                 scope,
@@ -1087,6 +1094,7 @@ impl ReferenceGraph {
         key: u128,
         value_type: ValueType,
         nullable: bool,
+        required: bool,
     ) -> Result<(), StepError> {
         let (kind, scope_id) = scope_parts(scope);
         self.require_catalog(namespace, catalog_kind(kind), scope_id)?;
@@ -1094,19 +1102,53 @@ impl ReferenceGraph {
         let next = Decl {
             type_tag: value_type.tag(),
             nullable,
+            required,
         };
-
-        let ns = self.ns_mut(namespace)?;
-        if let Some(current) = ns.declarations.get(&(kind, scope_id, key)) {
-            if *current == next {
-                return Ok(());
-            }
-            if current.type_tag != next.type_tag || (current.nullable && !next.nullable) {
-                return Err(StepError::SchemaConflict);
+        if let Some(ns) = self.namespaces.get(&namespace) {
+            for ((other_kind, other_scope, other_key), existing) in &ns.declarations {
+                if *other_kind == kind
+                    && *other_key == key
+                    && *other_scope != scope_id
+                    && existing.type_tag != next.type_tag
+                {
+                    return Err(StepError::SchemaConflict);
+                }
             }
         }
 
-        ns.declarations.insert((kind, scope_id, key), next);
+        let tightens = self
+            .namespaces
+            .get(&namespace)
+            .and_then(|ns| ns.declarations.get(&(kind, scope_id, key)))
+            .is_some_and(|current| {
+                *current != next
+                    && (current.type_tag != next.type_tag
+                        || (current.nullable && !next.nullable)
+                        || (!current.required && next.required))
+            });
+        if tightens
+            && scope_violates(
+                self.namespaces.get(&namespace).expect("namespace"),
+                kind,
+                scope_id,
+                key,
+                &next,
+            )
+        {
+            return Err(StepError::SchemaConflict);
+        }
+        if self
+            .namespaces
+            .get(&namespace)
+            .and_then(|ns| ns.declarations.get(&(kind, scope_id, key)))
+            == Some(&next)
+        {
+            return Ok(());
+        }
+
+        self.ns_mut(namespace)?
+            .declarations
+            .insert((kind, scope_id, key), next);
         Ok(())
     }
 
@@ -1258,16 +1300,12 @@ impl ReferenceGraph {
         let Some(ns) = self.namespaces.get(&namespace) else {
             return Ok(());
         };
-
-        let Some(decl) = applicable(ns, owner_kind, owner, key) else {
-            return Ok(());
-        };
-
-        if accepts(decl, value) {
-            Ok(())
-        } else {
-            Err(StepError::SchemaConflict)
+        for decl in applicable_all(ns, owner_kind, owner, key) {
+            if !accepts(decl, value) {
+                return Err(StepError::SchemaConflict);
+            }
         }
+        Ok(())
     }
 
     fn require_unique(
@@ -1490,19 +1528,48 @@ fn value_taken(
     Ok(false)
 }
 
-fn applicable(ns: &Ns, owner_kind: u8, owner: u128, key: u128) -> Option<&Decl> {
+fn applicable_all(ns: &Ns, owner_kind: u8, owner: u128, key: u128) -> Vec<&Decl> {
     if owner_kind == OWNER_NODE {
-        let node = ns.nodes.get(&owner)?;
-        for label in &node.labels {
-            if let Some(decl) = ns.declarations.get(&(SCOPE_LABEL, *label, key)) {
-                return Some(decl);
-            }
-        }
-        None
+        let Some(node) = ns.nodes.get(&owner) else {
+            return Vec::new();
+        };
+        node.labels
+            .iter()
+            .filter_map(|label| ns.declarations.get(&(SCOPE_LABEL, *label, key)))
+            .collect()
     } else {
-        let edge = ns.edges.get(&owner)?;
-        ns.declarations.get(&(SCOPE_TYPE, edge.edge_type, key))
+        let Some(edge) = ns.edges.get(&owner) else {
+            return Vec::new();
+        };
+        ns.declarations
+            .get(&(SCOPE_TYPE, edge.edge_type, key))
+            .into_iter()
+            .collect()
     }
+}
+
+fn scope_violates(ns: &Ns, kind: u8, scope: u128, key: u128, decl: &Decl) -> bool {
+    let owners: Vec<(u8, u128)> = if kind == SCOPE_LABEL {
+        ns.nodes
+            .iter()
+            .filter(|(_, node)| node.labels.contains(&scope))
+            .map(|(id, _)| (OWNER_NODE, *id))
+            .collect()
+    } else {
+        ns.edges
+            .iter()
+            .filter(|(_, edge)| edge.edge_type == scope)
+            .map(|(id, _)| (OWNER_EDGE, *id))
+            .collect()
+    };
+    for (owner_kind, owner) in owners {
+        match property(ns, owner_kind, owner, key) {
+            None if decl.required => return true,
+            Some(value) if !accepts(decl, value) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn accepts(decl: &Decl, value: &Value) -> bool {
@@ -1884,6 +1951,7 @@ mod tests {
             key: 1,
             value_type: ValueType::Int,
             nullable: false,
+            required: false,
         };
         apply(&mut graph, required.clone()).unwrap();
         assert_eq!(
@@ -1895,9 +1963,10 @@ mod tests {
                     key: 1,
                     value_type: ValueType::String,
                     nullable: false,
+                    required: false,
                 },
             ),
-            Err(StepError::SchemaConflict)
+            Ok(())
         );
         apply(
             &mut graph,
@@ -1907,6 +1976,7 @@ mod tests {
                 key: 1,
                 value_type: ValueType::Int,
                 nullable: true,
+                required: false,
             },
         )
         .unwrap();

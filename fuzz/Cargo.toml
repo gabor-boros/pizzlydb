@@ -99,6 +99,55 @@ doc = false
 bench = false
 
 [[bin]]
+name = "value_decimal"
+path = "fuzz_targets/value_decimal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_timestamp"
+path = "fuzz_targets/value_timestamp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_date"
+path = "fuzz_targets/value_date.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_local_datetime"
+path = "fuzz_targets/value_local_datetime.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_duration"
+path = "fuzz_targets/value_duration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_list"
+path = "fuzz_targets/value_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value_map"
+path = "fuzz_targets/value_map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "key"
 path = "fuzz_targets/key.rs"
 test = false

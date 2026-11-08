@@ -447,16 +447,23 @@ fn ranges_follow_value_order() {
         nodes[range].iter().map(|&node| Owner::Node(node)).collect()
     };
 
+    let order = |indexes: &[usize]| -> Vec<Owner> {
+        indexes
+            .iter()
+            .map(|&index| Owner::Node(nodes[index]))
+            .collect()
+    };
+
     let all = owners(&graph, &view, f.plain, Bound::Unbounded, Bound::Unbounded);
-    assert_eq!(all, node_at(0..values.len()));
-    let ints = owners(
+    assert_eq!(all, order(&[0, 1, 2, 5, 3, 6, 7, 4, 8, 9, 10, 11]));
+    let numbers = owners(
         &graph,
         &view,
         f.plain,
         Bound::Included(&Value::Int(i64::MIN)),
         Bound::Included(&Value::Int(i64::MAX)),
     );
-    assert_eq!(ints, node_at(2..5));
+    assert_eq!(numbers, order(&[2, 5, 3, 6, 7, 4]));
     let exclusive = owners(
         &graph,
         &view,
@@ -464,17 +471,17 @@ fn ranges_follow_value_order() {
         Bound::Excluded(&Value::Int(-10)),
         Bound::Excluded(&Value::Int(10)),
     );
-    assert_eq!(exclusive, node_at(3..4));
-    let floats = owners(
+    assert_eq!(exclusive, order(&[5, 3, 6, 7]));
+    let above_half = owners(
         &graph,
         &view,
         f.plain,
         Bound::Excluded(&Value::Float(-0.5)),
         Bound::Included(&Value::Float(f64::INFINITY)),
     );
-    assert_eq!(floats, node_at(6..8));
-    let negative_zero = lookup(&graph, &view, f.plain, &Value::Float(-0.0));
-    assert_eq!(negative_zero, node_at(6..7));
+    assert_eq!(above_half, order(&[3, 6, 7, 4]));
+    let zero = lookup(&graph, &view, f.plain, &Value::Float(-0.0));
+    assert_eq!(zero, order(&[3, 6]));
     let strings = owners(
         &graph,
         &view,

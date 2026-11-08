@@ -24,7 +24,7 @@ use crate::value::{Value, encode_value_key};
 ///
 /// assert!(key.as_bytes().starts_with(namespace.as_bytes()));
 /// assert_eq!(key.as_bytes()[KeyBuf::PREFIX_LEN - 1], 7);
-/// assert_eq!(key.len(), KeyBuf::PREFIX_LEN + 16 + 1 + 9);
+/// assert!(key.len() > KeyBuf::PREFIX_LEN + 16 + 1);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KeyBuf {

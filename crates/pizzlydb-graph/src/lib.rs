@@ -62,10 +62,13 @@ mod error;
 pub mod fuzz;
 mod index;
 mod keys;
+mod namespace;
 mod property;
 mod record;
 mod record_store;
 mod salvage;
+mod schema;
+mod stats;
 mod verify;
 
 pub use access::{IdScan, KeyRead};
@@ -73,10 +76,16 @@ pub use adjacency::{Direction, Neighbor, Neighbors};
 pub use batch::{GraphBatch, GraphScan, GraphTxn};
 pub use bulk::{LoadOptions, LoadReport, bulk_load};
 pub use catalog::{CatalogId, MAX_NAME_LEN};
-pub use error::GraphError;
-pub use index::{IndexDefinition, IndexScan};
+pub use error::{ConstraintKind, GraphError};
+pub use index::{IndexDefinition, IndexPhase, IndexProgress, IndexScan, IndexState};
+pub use namespace::{
+    NamespaceLimits, NamespaceMeta, NamespaceOptions, NamespaceRegistry, NamespaceState,
+    verify_registered,
+};
 pub use property::{Owner, PropertyDeclaration, Scope};
 pub use record::{EdgeRecord, NodeRecord};
-pub use record_store::GraphStore;
+pub use record_store::{DetachLimits, GraphStore};
 pub use salvage::{Omission, OmissionKind, OmissionReason, SalvageReport, salvage};
+pub use schema::{CatalogCache, CatalogSnapshot};
+pub use stats::{GraphStats, StatAsOf, Statistic};
 pub use verify::verify_full;

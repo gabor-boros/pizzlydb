@@ -14,6 +14,7 @@ fn declaration(value_type: ValueType, nullable: bool) -> PropertyDeclaration {
     PropertyDeclaration {
         value_type,
         nullable,
+        required: false,
     }
 }
 
@@ -127,15 +128,6 @@ fn declaration_changes_follow_the_conflict_rules() {
         .declare(&mut batch, scope, age, declaration(ValueType::Int, false))
         .unwrap();
     assert!(batch.is_empty());
-    for conflicting in [
-        declaration(ValueType::String, false),
-        declaration(ValueType::Float, true),
-    ] {
-        assert!(matches!(
-            graph.declare(&mut batch, scope, age, conflicting),
-            Err(GraphError::SchemaConflict)
-        ));
-    }
     assert!(matches!(
         graph.declare(
             &mut batch,
@@ -148,12 +140,16 @@ fn declaration_changes_follow_the_conflict_rules() {
     assert!(batch.is_empty());
 
     graph
+        .declare(
+            &mut batch,
+            scope,
+            age,
+            declaration(ValueType::String, false),
+        )
+        .unwrap();
+    graph
         .declare(&mut batch, scope, age, declaration(ValueType::Int, true))
         .unwrap();
-    assert!(matches!(
-        graph.declare(&mut batch, scope, age, declaration(ValueType::Int, false)),
-        Err(GraphError::SchemaConflict)
-    ));
     batch.commit().unwrap();
 
     let view = storage.snapshot().unwrap();
@@ -161,10 +157,21 @@ fn declaration_changes_follow_the_conflict_rules() {
         graph.declaration(&view, scope, age).unwrap(),
         Some(declaration(ValueType::Int, true))
     );
+
+    let mut batch = GraphBatch::begin(&storage).unwrap();
+    let node = graph.create_node(&mut batch).unwrap();
+    graph.add_label(&mut batch, node, person).unwrap();
+    graph
+        .set_property(&mut batch, node, age, &Value::Null)
+        .unwrap();
+    assert!(matches!(
+        graph.declare(&mut batch, scope, age, declaration(ValueType::Int, false)),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
 }
 
 #[test]
-fn declared_values_are_checked_against_the_lowest_label() {
+fn a_node_must_satisfy_every_label_declaration() {
     let vfs = MemoryVfs::new();
     let storage = create(&vfs);
     let graph = graph(1);
@@ -181,40 +188,36 @@ fn declared_values_are_checked_against_the_lowest_label() {
             declaration(ValueType::Int, false),
         )
         .unwrap();
+    assert!(matches!(
+        graph.declare(
+            &mut batch,
+            Scope::Label(second),
+            key,
+            declaration(ValueType::String, true),
+        ),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
     graph
         .declare(
             &mut batch,
             Scope::Label(second),
             key,
-            declaration(ValueType::String, true),
+            declaration(ValueType::Int, true),
         )
         .unwrap();
     let node = graph.create_node(&mut batch).unwrap();
     graph
         .set_labels(&mut batch, node, &[second, first])
         .unwrap();
-
-    let staged = dump(&batch);
-    for rejected in [Value::from("text"), Value::Null, Value::Bool(true)] {
-        assert!(matches!(
-            graph.set_property(&mut batch, node, key, &rejected),
-            Err(GraphError::SchemaConflict)
-        ));
-    }
-    assert_eq!(dump(&batch), staged);
+    assert!(matches!(
+        graph.set_property(&mut batch, node, key, &Value::Null),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
     graph
         .set_property(&mut batch, node, key, &Value::Int(7))
         .unwrap();
     assert_eq!(count_kind(&batch, DECLARED_CELL), 1);
-
-    graph.remove_label(&mut batch, node, first).unwrap();
-    graph
-        .set_property(&mut batch, node, key, &Value::Null)
-        .unwrap();
-    assert_eq!(
-        graph.get_property(&batch, node, key).unwrap(),
-        Some(Value::Null)
-    );
+    assert_eq!(count_kind(&batch, UNDECLARED_CELL), 0);
 }
 
 #[test]
@@ -243,7 +246,8 @@ fn clearing_removes_both_cells() {
         graph.get_property(&batch, node, key).unwrap(),
         Some(Value::from("old"))
     );
-    assert_eq!(count_kind(&batch, UNDECLARED_CELL), 1);
+    assert_eq!(count_kind(&batch, DECLARED_CELL), 1);
+    assert_eq!(count_kind(&batch, UNDECLARED_CELL), 0);
 
     graph
         .set_property(&mut batch, node, key, &Value::from("new"))
@@ -290,7 +294,7 @@ fn edge_properties_follow_the_type_declaration_and_die_with_the_edge() {
     let edge = graph.create_edge(&mut batch, a, a, knows).unwrap();
     assert!(matches!(
         graph.set_property(&mut batch, edge, since, &Value::from("1999")),
-        Err(GraphError::SchemaConflict)
+        Err(GraphError::ConstraintViolation { .. })
     ));
     graph
         .set_property(&mut batch, edge, since, &Value::Int(1999))

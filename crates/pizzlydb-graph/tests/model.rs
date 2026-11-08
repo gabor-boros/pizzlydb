@@ -210,6 +210,7 @@ fn apply_op<V: Vfs>(batch: &mut GraphTxn<V>, op: &Operation) -> Result<(), StepE
             key,
             value_type,
             nullable,
+            required,
         } => store(*namespace)?
             .declare(
                 batch,
@@ -218,6 +219,7 @@ fn apply_op<V: Vfs>(batch: &mut GraphTxn<V>, op: &Operation) -> Result<(), StepE
                 PropertyDeclaration {
                     value_type: *value_type,
                     nullable: *nullable,
+                    required: *required,
                 },
             )
             .map_err(map_graph),
@@ -515,6 +517,7 @@ fn copy_declarations(
                 DeclFact {
                     type_tag: declaration.value_type.tag(),
                     nullable: declaration.nullable,
+                    required: declaration.required,
                 },
             );
         }
@@ -650,7 +653,9 @@ fn map_graph(err: GraphError) -> StepError {
         GraphError::EndpointInUse => StepError::EndpointInUse,
         GraphError::InvalidName => StepError::InvalidName,
         GraphError::NameConflict => StepError::NameConflict,
-        GraphError::SchemaConflict => StepError::SchemaConflict,
+        GraphError::SchemaConflict | GraphError::ConstraintViolation { .. } => {
+            StepError::SchemaConflict
+        }
         GraphError::UniqueConflict => StepError::UniqueConflict,
         GraphError::InvalidValue => StepError::InvalidValue,
         other => StepError::Other(other.to_string()),

@@ -229,6 +229,7 @@ fn propose(
             key: pick(rng, &keys).unwrap_or(1),
             value_type: ValueType::Int,
             nullable: rng.random::<bool>(),
+            required: false,
         };
     }
 
@@ -506,6 +507,7 @@ fn compile_raw(raw: &Raw) -> Operation {
             key: right,
             value_type: ValueType::Int,
             nullable: raw.flag.is_multiple_of(2),
+            required: false,
         },
         14 => Operation::CreateIndex {
             namespace,

@@ -1,6 +1,6 @@
 # ADR-002: Property-graph identity, value types, key encoding, and schema model
 
-- Status: Accepted (part 1, identity). Part 2, value types and schema, remains open for [040](../roadmap/040-type-system-and-value-model.md).
+- Status: Accepted
 - Date: 2026-11-07
 - Owner issues: [034](../roadmap/034-id-allocation-and-identity-policy.md), [040](../roadmap/040-type-system-and-value-model.md)
 - Guide: [§3.1](../architecture/implementation-guide.md#31-entities), [§3.2](../architecture/implementation-guide.md#32-integrity)
@@ -21,7 +21,7 @@ The open questions for this part are the id layout, whether clients may supply i
 5. `NotFound` means the record key is absent and there is no tombstone. `Deleted` means the record is a tombstone. That holds for allocator ids and client ids.
 6. The graph logical format version is 1, stored at `sys/format`. The counter key kind `0x01` is not written.
 
-Value types, numeric order across integers and floats, and the decimal, temporal, and collection types are not decided here.
+Value types, numeric order, names, and over-long index keys are decided in [RFC 0001](../rfcs/0001-type-system.md). The graph logical format version stays 1.
 
 ## Consequences
 

@@ -156,7 +156,7 @@ fn full_verify_rejects_one_fault_per_structure() {
             .unwrap();
         batch.commit().unwrap();
         let view = storage.snapshot().unwrap();
-        let key = kind_key(&view, 0x0C);
+        let key = kind_key(&view, 0x0B);
         drop(view);
         put_key(storage, &key, &encode_value(&Value::from("Bob")).unwrap());
     });

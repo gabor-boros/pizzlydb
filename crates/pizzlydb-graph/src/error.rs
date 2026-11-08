@@ -1,8 +1,33 @@
 //! Errors returned by graph operations.
 
+use pizzlydb_core::PropertyKeyId;
 use pizzlydb_storage::StorageError;
 use pizzlydb_txn::TxnError;
 use thiserror::Error;
+
+/// Why a constraint rejected a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstraintKind {
+    /// A required property is absent.
+    RequiredMissing,
+    /// A present value has the wrong type.
+    TypeMismatch,
+    /// A present value is null and the declaration forbids null.
+    NullForbidden,
+    /// Two declarations of one property key require different types.
+    DeclarationConflict,
+}
+
+impl std::fmt::Display for ConstraintKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RequiredMissing => "required property is missing",
+            Self::TypeMismatch => "value has the wrong type",
+            Self::NullForbidden => "null is not allowed",
+            Self::DeclarationConflict => "declarations disagree on the value type",
+        })
+    }
+}
 
 /// Failure from a [`GraphStore`](crate::GraphStore) operation.
 ///
@@ -44,13 +69,32 @@ pub enum GraphError {
     /// A rename target is already used by another identifier.
     #[error("name is already in use")]
     NameConflict,
-    /// A declaration change is incompatible, or a value does not match the
-    /// declaration that applies to it.
+    /// A declaration change is incompatible with another declaration.
     #[error("schema conflict")]
     SchemaConflict,
+    /// A value or schema change breaks a constraint.
+    #[error("constraint violation: {kind}: {detail}")]
+    ConstraintViolation {
+        /// Which rule failed.
+        kind: ConstraintKind,
+        /// `1` for a node, `2` for an edge, `0` when the failure is not about one entity.
+        entity_kind: u8,
+        /// Identifier bytes.
+        entity: [u8; 16],
+        /// Property key, when the rule names one.
+        key: Option<PropertyKeyId>,
+        /// Short explanation.
+        detail: String,
+    },
     /// Another entity already holds the value in a unique index.
     #[error("unique value is already in use")]
     UniqueConflict,
+    /// A unique index build found duplicate values.
+    #[error("duplicate values")]
+    DuplicateValues {
+        /// Owners that hold the repeated value, including the one being indexed.
+        owners: Vec<[u8; 16]>,
+    },
     /// A value cannot be encoded: NaN, or a string or byte string longer than
     /// `u32::MAX` bytes.
     #[error("invalid value")]
@@ -66,6 +110,23 @@ pub enum GraphError {
     /// A counter has issued its last identifier.
     #[error("identifier space is exhausted")]
     IdExhausted,
+    /// The namespace is not in the registry.
+    #[error("namespace was not found")]
+    NamespaceNotFound,
+    /// The namespace is marked dropping and rejects new work.
+    #[error("namespace is being dropped")]
+    NamespaceDropping,
+    /// Detach delete would remove more edges than the caller allowed.
+    #[error("too many incident edges (limit {limit}, found at least {found_at_least})")]
+    TooManyIncidentEdges {
+        /// Configured maximum.
+        limit: u64,
+        /// Count observed before the operation stopped. It is greater than `limit`.
+        found_at_least: u64,
+    },
+    /// An index exists but is not `Ready`.
+    #[error("index is not ready")]
+    IndexNotReady,
     /// Stored graph bytes failed to decode.
     #[error("stored graph data is corrupt")]
     Corrupt,
@@ -98,6 +159,41 @@ impl From<TxnError> for GraphError {
             TxnError::IdExhausted => Self::IdExhausted,
             TxnError::InvalidClientId | TxnError::ClientIdsDisabled => Self::InvalidIdentity,
             other => Self::Transaction(other),
+        }
+    }
+}
+
+impl GraphError {
+    /// Canonical protocol error name for this failure.
+    ///
+    /// Constraint failures are `CONSTRAINT_VIOLATION`. A detach that exceeds
+    /// its edge limit is `RESOURCE_EXHAUSTED`.
+    #[must_use]
+    pub fn client_code(&self) -> &'static str {
+        match self {
+            Self::ConstraintViolation { .. }
+            | Self::SchemaConflict
+            | Self::UniqueConflict
+            | Self::DuplicateValues { .. }
+            | Self::NameConflict
+            | Self::EndpointInUse
+            | Self::EndpointNotLive => "CONSTRAINT_VIOLATION",
+            Self::TooManyIncidentEdges { .. }
+            | Self::KeyTooLarge
+            | Self::ValueTooLarge
+            | Self::IdExhausted => "RESOURCE_EXHAUSTED",
+            Self::NotFound | Self::Deleted | Self::NamespaceNotFound | Self::InvalidIdentity => {
+                "NOT_FOUND"
+            }
+            Self::NamespaceDropping | Self::IndexNotReady => "NOT_FOUND",
+            Self::InvalidName | Self::InvalidValue => "INVALID_ARGUMENT",
+            Self::Transaction(err) => match err {
+                TxnError::Conflict { .. } => "TX_CONFLICT",
+                TxnError::Expired | TxnError::SnapshotTooOld => "TX_EXPIRED",
+                TxnError::TransactionTooLarge { .. } => "RESOURCE_EXHAUSTED",
+                _ => "INTERNAL",
+            },
+            Self::Storage(_) | Self::Corrupt | Self::VerificationFailed => "INTERNAL",
         }
     }
 }

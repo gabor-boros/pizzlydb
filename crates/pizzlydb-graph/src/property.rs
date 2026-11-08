@@ -4,22 +4,21 @@
 //! cell format of [`encode_value`]. A missing key is absence; a stored
 //! [`Value::Null`] is null.
 //!
-//! A declaration gives a property key a value type and a nullable flag within
-//! a label or relationship-type scope. The declaration that applies to a node
-//! is the one on its lowest-id label that declares the key; for an edge it is
-//! the declaration on its relationship type. A value set under a declaration
-//! is stored in a declared cell and checked against it. Other values are
-//! stored in an undeclared cell. A read returns the declared cell when it
-//! exists, including a declared null, and the undeclared cell otherwise.
-//! Setting or clearing a property removes the other cell, so a stale cell
-//! cannot reappear.
+//! A declaration gives a property key a value type, a nullable flag, and a
+//! required flag within a label or relationship-type scope. A node must
+//! satisfy the declarations of every label it carries. An edge must satisfy
+//! the declaration on its relationship type. Required properties are checked
+//! at commit. Type and null checks on a write fail immediately.
 //!
-//! Adding or loosening a declaration does not rewrite existing cells.
+//! Tightening a declaration validates the members of its scope in the caller's
+//! transaction. Loosening one does not rewrite cells.
 //!
 //! A cell value whose leaf entry does not fit one storage page is written to
 //! the storage engine's overflow pages. An encoded cell longer than
 //! [`MAX_VALUE_LEN`](pizzlydb_storage::MAX_VALUE_LEN) is rejected with
-//! [`GraphError::ValueTooLarge`].
+//! [`GraphError::ValueTooLarge`]. An index key longer than
+//! [`MAX_KEY_LEN`](pizzlydb_storage::MAX_KEY_LEN) is rejected with
+//! [`GraphError::KeyTooLarge`] at write time. The index does not store a prefix.
 
 use pizzlydb_core::{
     EdgeId, ID_LEN, LabelId, NamespaceId, NodeId, PropertyKeyId, TypeId, Value, ValueType,
@@ -162,7 +161,13 @@ impl From<TypeId> for Scope {
     }
 }
 
-/// Value type and null rule of a declared property.
+/// Value type, null rule, and presence rule of a declared property.
+///
+/// A node satisfies every declaration of its labels. An edge satisfies the
+/// declaration of its relationship type. Conflicting value types for one
+/// property key are rejected when the second declaration is created.
+/// `required` is checked at commit, so a transaction may create a node and
+/// set the property before `commit`.
 ///
 /// # Examples
 ///
@@ -170,7 +175,7 @@ impl From<TypeId> for Scope {
 /// use pizzlydb_core::{Value, ValueType};
 /// use pizzlydb_graph::PropertyDeclaration;
 ///
-/// let age = PropertyDeclaration { value_type: ValueType::Int, nullable: false };
+/// let age = PropertyDeclaration::new(ValueType::Int, false);
 /// assert!(age.accepts(&Value::Int(42)));
 /// assert!(!age.accepts(&Value::Null));
 /// assert!(!age.accepts(&Value::from("42")));
@@ -181,9 +186,21 @@ pub struct PropertyDeclaration {
     pub value_type: ValueType,
     /// `true` when [`Value::Null`] is accepted.
     pub nullable: bool,
+    /// `true` when the property must be present at commit.
+    pub required: bool,
 }
 
 impl PropertyDeclaration {
+    /// Declaration that is not required.
+    #[must_use]
+    pub const fn new(value_type: ValueType, nullable: bool) -> Self {
+        Self {
+            value_type,
+            nullable,
+            required: false,
+        }
+    }
+
     /// `true` when `value` satisfies this declaration.
     ///
     /// # Examples
@@ -192,7 +209,7 @@ impl PropertyDeclaration {
     /// use pizzlydb_core::{Value, ValueType};
     /// use pizzlydb_graph::PropertyDeclaration;
     ///
-    /// let nickname = PropertyDeclaration { value_type: ValueType::String, nullable: true };
+    /// let nickname = PropertyDeclaration::new(ValueType::String, true);
     /// assert!(nickname.accepts(&Value::Null));
     /// assert!(nickname.accepts(&Value::from("Bob")));
     /// ```
@@ -205,20 +222,29 @@ impl PropertyDeclaration {
     }
 
     pub(crate) fn encode(self) -> Vec<u8> {
-        vec![
-            DECLARATION_VERSION,
-            self.value_type.tag(),
-            u8::from(self.nullable),
-        ]
+        let mut flags = u8::from(self.nullable);
+        if self.required {
+            flags |= 0b10;
+        }
+        vec![DECLARATION_VERSION, self.value_type.tag(), flags]
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
         match bytes {
-            [DECLARATION_VERSION, tag, nullable @ (0 | 1)] => Ok(Self {
+            [DECLARATION_VERSION, tag, flags] if flags & !0b11 == 0 => Ok(Self {
                 value_type: ValueType::from_tag(*tag).map_err(corrupt)?,
-                nullable: *nullable == 1,
+                nullable: flags & 0b01 == 0b01,
+                required: flags & 0b10 == 0b10,
             }),
             _ => Err(GraphError::Corrupt),
+        }
+    }
+
+    fn image(self) -> pizzlydb_core::DeclarationImage {
+        pizzlydb_core::DeclarationImage {
+            value_type: self.value_type,
+            nullable: self.nullable,
+            required: self.required,
         }
     }
 }
@@ -226,15 +252,18 @@ impl PropertyDeclaration {
 impl GraphStore {
     /// Declare property `key` within `scope`.
     ///
-    /// Repeating the current declaration stages nothing. Changing a required
-    /// declaration to nullable updates it. Existing cells are not rewritten.
+    /// Repeating the current declaration stages nothing. Loosening nullability
+    /// or `required` updates the declaration. Tightening, including a type
+    /// change, validates every current member in this transaction and fails
+    /// with [`GraphError::ConstraintViolation`] when one does not satisfy the
+    /// new declaration. A different value type for the same key on another
+    /// label or relationship type is rejected.
     ///
     /// # Errors
     ///
-    /// Returns [`GraphError::SchemaConflict`] when a declaration exists with a
-    /// different value type, or when a nullable declaration would become
-    /// required; [`GraphError::InvalidIdentity`] when the scope or `key` was
-    /// not issued in this namespace; and [`GraphError::Storage`] or
+    /// Returns [`GraphError::ConstraintViolation`] when existing data or
+    /// another declaration conflicts, [`GraphError::InvalidIdentity`] when the
+    /// scope or `key` was not issued, and [`GraphError::Storage`] or
     /// [`GraphError::Corrupt`] on a failed read.
     ///
     /// # Examples
@@ -244,7 +273,7 @@ impl GraphStore {
     /// use std::path::Path;
     ///
     /// use pizzlydb_core::{LabelId, NamespaceId, PropertyKeyId, ValueType};
-    /// use pizzlydb_graph::{GraphTxn, GraphBatch, GraphError, GraphStore, PropertyDeclaration, Scope};
+    /// use pizzlydb_graph::{ConstraintKind, GraphBatch, GraphError, GraphStore, PropertyDeclaration, Scope};
     /// use pizzlydb_storage::{Durability, MemoryVfs, Storage};
     ///
     /// let vfs = MemoryVfs::new();
@@ -253,17 +282,21 @@ impl GraphStore {
     ///
     /// let mut batch = GraphBatch::begin(&storage)?;
     /// let person: LabelId = graph.intern(&mut batch, "Person")?;
+    /// let place: LabelId = graph.intern(&mut batch, "Place")?;
     /// let age: PropertyKeyId = graph.intern(&mut batch, "age")?;
     /// let scope = Scope::Label(person);
     ///
-    /// let required = PropertyDeclaration { value_type: ValueType::Int, nullable: false };
+    /// let required = PropertyDeclaration::new(ValueType::Int, false);
     /// graph.declare(&mut batch, scope, age, required)?;
-    /// let text = PropertyDeclaration { value_type: ValueType::String, nullable: false };
+    /// graph.declare(&mut batch, scope, age, required)?;
+    /// assert!(batch.mutations().iter().any(|mutation| {
+    ///     matches!(mutation, pizzlydb_core::GraphMutation::DeclarationChange { .. })
+    /// }));
+    /// let text = PropertyDeclaration::new(ValueType::String, false);
     /// assert!(matches!(
-    ///     graph.declare(&mut batch, scope, age, text),
-    ///     Err(GraphError::SchemaConflict)
+    ///     graph.declare(&mut batch, Scope::Label(place), age, text),
+    ///     Err(GraphError::ConstraintViolation { kind: ConstraintKind::DeclarationConflict, .. })
     /// ));
-    ///
     /// let optional = PropertyDeclaration { nullable: true, ..required };
     /// graph.declare(&mut batch, scope, age, optional)?;
     /// assert_eq!(graph.declaration(&batch, scope, age)?, Some(optional));
@@ -278,42 +311,70 @@ impl GraphStore {
         declaration: PropertyDeclaration,
     ) -> Result<(), GraphError> {
         let namespace = self.namespace();
+        self.ensure(batch)?;
         scope.ensure_issued(batch, namespace)?;
         catalog::ensure_issued(batch, namespace, key)?;
+        reject_type_conflict(batch, namespace, scope, key, declaration.value_type)?;
 
         let existing = self.declaration(batch, scope, key)?;
         if let Some(current) = existing {
             if current == declaration {
                 return Ok(());
             }
-
-            if current.value_type != declaration.value_type
-                || (current.nullable && !declaration.nullable)
-            {
-                return Err(GraphError::SchemaConflict);
+            if tightens(current, declaration) {
+                validate_scope(batch, namespace, scope, key, declaration)?;
             }
         }
 
-        batch.put(
-            keys::declaration(namespace, scope, key),
-            declaration.encode(),
-        )?;
-        batch.record(pizzlydb_core::GraphMutation::DeclarationChange {
-            namespace,
-            scope_kind: scope.kind(),
-            scope: *scope.id_bytes(),
-            key,
-            previous: existing.map(|current| pizzlydb_core::DeclarationImage {
-                value_type: current.value_type,
-                nullable: current.nullable,
-            }),
-            declaration: Some(pizzlydb_core::DeclarationImage {
-                value_type: declaration.value_type,
-                nullable: declaration.nullable,
-            }),
-        });
+        batch.atomic(|batch| {
+            batch.put(
+                keys::declaration(namespace, scope, key),
+                declaration.encode(),
+            )?;
+            batch.record(pizzlydb_core::GraphMutation::DeclarationChange {
+                namespace,
+                scope_kind: scope.kind(),
+                scope: *scope.id_bytes(),
+                key,
+                previous: existing.map(PropertyDeclaration::image),
+                declaration: Some(declaration.image()),
+            });
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::DECLARATION)?;
+            Ok(())
+        })
+    }
 
-        Ok(())
+    /// Remove the declaration of `key` within `scope`.
+    ///
+    /// Cells stay where they are. Removing an absent declaration stages nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::Storage`] or [`GraphError::Corrupt`] on a failed read.
+    pub fn undeclare<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        scope: Scope,
+        key: PropertyKeyId,
+    ) -> Result<(), GraphError> {
+        let namespace = self.namespace();
+        self.ensure(batch)?;
+        let Some(existing) = self.declaration(batch, scope, key)? else {
+            return Ok(());
+        };
+        batch.atomic(|batch| {
+            batch.delete(keys::declaration(namespace, scope, key))?;
+            batch.record(pizzlydb_core::GraphMutation::DeclarationChange {
+                namespace,
+                scope_kind: scope.kind(),
+                scope: *scope.id_bytes(),
+                key,
+                previous: Some(existing.image()),
+                declaration: None,
+            });
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::UNDECLARE)?;
+            Ok(())
+        })
     }
 
     /// Declaration of `key` within `scope`, or [`None`].
@@ -408,20 +469,22 @@ impl GraphStore {
     ) -> Result<(), GraphError> {
         let owner = owner.into();
         let namespace = self.namespace();
-        let declaration = applicable_declaration(batch, namespace, owner, key)?;
+        self.ensure(batch)?;
+        directory::ensure_live(batch, namespace, owner)?;
         catalog::ensure_issued(batch, namespace, key)?;
-
+        let rules = declarations_for(batch, namespace, owner, key)?;
         let encoded = encode_value(value).map_err(invalid_value)?;
-        if declaration.is_some_and(|declaration| !declaration.accepts(value)) {
-            return Err(GraphError::SchemaConflict);
+        if let Some(violation) = rules
+            .iter()
+            .find_map(|rule| mismatch(owner, key, rule, value))
+        {
+            return Err(violation);
         }
 
         let previous = read_cell(batch, namespace, owner, key)?;
-        let declared = declaration.is_some();
         let (node, edge) = owner_ids(owner);
         batch.atomic(|batch| {
-            batch.put(keys::cell(namespace, declared, owner, key), encoded)?;
-            batch.delete(keys::cell(namespace, !declared, owner, key))?;
+            batch.put(keys::cell(namespace, owner, key), encoded)?;
             index::apply_property_index(
                 batch,
                 namespace,
@@ -438,6 +501,7 @@ impl GraphStore {
                 previous: previous.clone(),
                 value: value.clone(),
             });
+            batch.note_owner(namespace, owner);
             Ok(())
         })
     }
@@ -528,8 +592,13 @@ impl GraphStore {
     ) -> Result<(), GraphError> {
         let owner = owner.into();
         let namespace = self.namespace();
+        self.ensure(batch)?;
         directory::ensure_live(batch, namespace, owner)?;
-        batch.atomic(|batch| clear_cell(batch, namespace, owner, key))
+        batch.atomic(|batch| {
+            clear_cell(batch, namespace, owner, key)?;
+            batch.note_owner(namespace, owner);
+            Ok(())
+        })
     }
 }
 
@@ -540,21 +609,15 @@ pub(crate) fn clear_all<V: Vfs>(
     owner: Owner,
 ) -> Result<(), GraphError> {
     let mut property_keys = Vec::new();
-    for declared in [true, false] {
-        let ids: IdScan<'_, _, PropertyKeyId> =
-            IdScan::new(batch, keys::cells(namespace, declared, owner))?;
-        for id in ids {
-            property_keys.push(id?);
-        }
+    let ids: IdScan<'_, _, PropertyKeyId> = IdScan::new(batch, keys::cells(namespace, owner))?;
+    for id in ids {
+        property_keys.push(id?);
     }
-
     property_keys.sort_unstable();
     property_keys.dedup();
-
     for key in property_keys {
         clear_cell(batch, namespace, owner, key)?;
     }
-
     Ok(())
 }
 
@@ -567,11 +630,7 @@ fn clear_cell<V: Vfs>(
     let Some(previous) = read_cell(batch, namespace, owner, key)? else {
         return Ok(());
     };
-
-    for declared in [true, false] {
-        batch.delete(keys::cell(namespace, declared, owner, key))?;
-    }
-
+    batch.delete(keys::cell(namespace, owner, key))?;
     let (node, edge) = owner_ids(owner);
     batch.record(pizzlydb_core::GraphMutation::PropertyClear {
         namespace,
@@ -590,45 +649,167 @@ fn owner_ids(owner: Owner) -> (Option<NodeId>, Option<EdgeId>) {
     }
 }
 
-/// Effective value of `key`: the declared cell, else the undeclared cell.
+/// Effective value of `key`.
 pub(crate) fn read_cell<R: KeyRead>(
     read: &R,
     namespace: NamespaceId,
     owner: Owner,
     key: PropertyKeyId,
 ) -> Result<Option<Value>, GraphError> {
-    for declared in [true, false] {
-        if let Some(bytes) = read.get(&keys::cell(namespace, declared, owner, key))? {
-            return decode_value(&bytes).map(Some).map_err(corrupt);
-        }
+    match read.get(&keys::cell(namespace, owner, key))? {
+        Some(bytes) => decode_value(&bytes).map(Some).map_err(corrupt),
+        None => Ok(None),
     }
-
-    Ok(None)
 }
 
-/// Declaration of `key` that applies to a live `owner`.
-fn applicable_declaration<R: KeyRead>(
+fn declarations_for<R: KeyRead>(
     read: &R,
     namespace: NamespaceId,
     owner: Owner,
     key: PropertyKeyId,
-) -> Result<Option<PropertyDeclaration>, GraphError> {
+) -> Result<Vec<PropertyDeclaration>, GraphError> {
     let graph = GraphStore::new(namespace);
+    let mut found = Vec::new();
     match owner {
         Owner::Node(node) => {
-            directory::load_node(read, namespace, node)?;
             let labels: IdScan<'_, R, LabelId> =
                 IdScan::new(read, keys::node_labels(namespace, node))?;
             for label in labels {
                 if let Some(declaration) = graph.declaration(read, Scope::Label(label?), key)? {
-                    return Ok(Some(declaration));
+                    found.push(declaration);
                 }
             }
-            Ok(None)
         }
         Owner::Edge(edge) => {
             let record = directory::load_edge(read, namespace, edge)?;
-            graph.declaration(read, Scope::Type(record.edge_type), key)
+            if let Some(declaration) =
+                graph.declaration(read, Scope::Type(record.edge_type), key)?
+            {
+                found.push(declaration);
+            }
         }
     }
+    Ok(found)
+}
+
+fn mismatch(
+    owner: Owner,
+    key: PropertyKeyId,
+    rule: &PropertyDeclaration,
+    value: &Value,
+) -> Option<GraphError> {
+    if rule.accepts(value) {
+        return None;
+    }
+    let kind = if value.value_type().is_none() {
+        crate::error::ConstraintKind::NullForbidden
+    } else {
+        crate::error::ConstraintKind::TypeMismatch
+    };
+    Some(violation(
+        kind,
+        owner,
+        Some(key),
+        "value does not match the declaration",
+    ))
+}
+
+pub(crate) fn violation(
+    kind: crate::error::ConstraintKind,
+    owner: Owner,
+    key: Option<PropertyKeyId>,
+    detail: &str,
+) -> GraphError {
+    GraphError::ConstraintViolation {
+        kind,
+        entity_kind: owner.kind(),
+        entity: *owner.id_bytes(),
+        key,
+        detail: detail.to_owned(),
+    }
+}
+
+fn tightens(current: PropertyDeclaration, next: PropertyDeclaration) -> bool {
+    current.value_type != next.value_type
+        || (current.nullable && !next.nullable)
+        || (!current.required && next.required)
+}
+
+fn reject_type_conflict<R: KeyRead>(
+    read: &R,
+    namespace: NamespaceId,
+    scope: Scope,
+    key: PropertyKeyId,
+    value_type: ValueType,
+) -> Result<(), GraphError> {
+    let prefix = keys::declaration_keys(namespace);
+    for entry in crate::access::PrefixScan::new(read, prefix.clone())? {
+        let (stored, bytes) = entry?;
+        if stored.len() != prefix.len() + 1 + 32 {
+            return Err(GraphError::Corrupt);
+        }
+        let kind = stored[prefix.len()];
+        if kind != scope.kind() {
+            continue;
+        }
+        let other = Scope::decode(kind, &stored, prefix.len() + 1)?;
+        let property = id_at_key(&stored, prefix.len() + 1 + 16)?;
+        if property != key || other == scope {
+            continue;
+        }
+        let declaration = PropertyDeclaration::decode(&bytes)?;
+        if declaration.value_type != value_type {
+            return Err(GraphError::ConstraintViolation {
+                kind: crate::error::ConstraintKind::DeclarationConflict,
+                entity_kind: 0,
+                entity: [0; 16],
+                key: Some(key),
+                detail: "another scope declares a different type for this key".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn id_at_key(bytes: &[u8], offset: usize) -> Result<PropertyKeyId, GraphError> {
+    crate::access::id_at(bytes, offset)
+}
+
+fn validate_scope<V: Vfs>(
+    batch: &mut GraphTxn<V>,
+    namespace: NamespaceId,
+    scope: Scope,
+    key: PropertyKeyId,
+    declaration: PropertyDeclaration,
+) -> Result<(), GraphError> {
+    let graph = GraphStore::new(namespace);
+    let owners: Vec<Owner> = match scope {
+        Scope::Label(label) => graph
+            .nodes_with_label(batch, label)?
+            .map(|node| node.map(Owner::Node))
+            .collect::<Result<Vec<_>, _>>()?,
+        Scope::Type(edge_type) => graph
+            .edges_with_type(batch, edge_type)?
+            .map(|edge| edge.map(Owner::Edge))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    for owner in owners {
+        match read_cell(batch, namespace, owner, key)? {
+            None if declaration.required => {
+                return Err(violation(
+                    crate::error::ConstraintKind::RequiredMissing,
+                    owner,
+                    Some(key),
+                    "required property is absent",
+                ));
+            }
+            None => {}
+            Some(value) => {
+                if let Some(err) = mismatch(owner, key, &declaration, &value) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(())
 }

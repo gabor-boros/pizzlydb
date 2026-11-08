@@ -9,8 +9,8 @@
 //! - unique index: `index || value` to the owner. [`Value::Null`] has no
 //!   entry, so any number of owners may hold null.
 //!
-//! `value` is the key format of [`encode_value_key`], so entries sort by
-//! value type tag (null, bool, int, float, string, bytes) and then by value.
+//! `value` is the key format of [`encode_value_key`], so entries of numeric
+//! types sort by exact numeric value and other types sort by their key tag.
 //!
 //! Membership keys list the nodes with a label and the edges of a type.
 //!
@@ -40,7 +40,65 @@ use crate::record::EdgeRecord;
 use crate::record_store::GraphStore;
 
 const DEFINITION_VERSION: u8 = 1;
-const DEFINITION_LEN: usize = 3 + 2 * ID_LEN;
+const DEFINITION_LEN: usize = 53;
+
+/// Build phase of an index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IndexPhase {
+    /// Writes maintain the index. Backfill may still be running.
+    Building,
+    /// Lookups may use the index.
+    Ready,
+    /// Entries are being removed. Lookups must not use the index.
+    Dropping,
+    /// Entries are gone. The id is kept so it is not reused.
+    Dropped,
+}
+
+/// Stored index, including its phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IndexState {
+    /// Scope, key, and uniqueness.
+    pub definition: IndexDefinition,
+    /// Lifecycle phase.
+    pub phase: IndexPhase,
+    /// `true` when backfill has visited every current member.
+    pub backfill_done: bool,
+    /// Last owner id included by backfill. Zero means none.
+    pub progress: u128,
+}
+
+/// Progress reported for an index build or drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexProgress {
+    /// Current phase.
+    pub phase: IndexPhase,
+    /// Last backfilled owner, or zero.
+    pub progress: u128,
+    /// Backfill has reached the end of the scope.
+    pub backfill_done: bool,
+}
+
+impl IndexPhase {
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Building => 1,
+            Self::Ready => 2,
+            Self::Dropping => 3,
+            Self::Dropped => 4,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Result<Self, GraphError> {
+        match byte {
+            1 => Ok(Self::Building),
+            2 => Ok(Self::Ready),
+            3 => Ok(Self::Dropping),
+            4 => Ok(Self::Dropped),
+            _ => Err(GraphError::Corrupt),
+        }
+    }
+}
 
 /// Scope, property key, and uniqueness of an index.
 ///
@@ -82,25 +140,59 @@ pub struct IndexDefinition {
 
 impl IndexDefinition {
     pub(crate) fn encode(&self) -> Vec<u8> {
+        IndexState {
+            definition: *self,
+            phase: IndexPhase::Ready,
+            backfill_done: true,
+            progress: 0,
+        }
+        .encode()
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
+        Ok(IndexState::decode(bytes)?.definition)
+    }
+}
+
+impl IndexState {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(DEFINITION_LEN);
-        out.extend_from_slice(&[DEFINITION_VERSION, self.scope.kind()]);
-        out.extend_from_slice(self.scope.id_bytes());
-        out.extend_from_slice(self.key.as_bytes());
-        out.push(u8::from(self.unique));
+        out.extend_from_slice(&[DEFINITION_VERSION, self.definition.scope.kind()]);
+        out.extend_from_slice(self.definition.scope.id_bytes());
+        out.extend_from_slice(self.definition.key.as_bytes());
+        out.push(u8::from(self.definition.unique));
+        out.push(self.phase.byte());
+        out.push(u8::from(self.backfill_done));
+        out.extend_from_slice(&self.progress.to_be_bytes());
         out
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, GraphError> {
-        match bytes {
-            [DEFINITION_VERSION, kind, .., unique @ (0 | 1)] if bytes.len() == DEFINITION_LEN => {
-                Ok(Self {
-                    scope: Scope::decode(*kind, bytes, 2)?,
-                    key: id_at(bytes, 2 + ID_LEN)?,
-                    unique: *unique == 1,
-                })
-            }
-            _ => Err(GraphError::Corrupt),
+        if bytes.len() != DEFINITION_LEN || bytes[0] != DEFINITION_VERSION {
+            return Err(GraphError::Corrupt);
         }
+        let unique = match bytes[34] {
+            0 => false,
+            1 => true,
+            _ => return Err(GraphError::Corrupt),
+        };
+        let done = match bytes[36] {
+            0 => false,
+            1 => true,
+            _ => return Err(GraphError::Corrupt),
+        };
+        let mut progress = [0_u8; 16];
+        progress.copy_from_slice(&bytes[37..53]);
+        Ok(Self {
+            definition: IndexDefinition {
+                scope: Scope::decode(bytes[1], bytes, 2)?,
+                key: id_at(bytes, 2 + ID_LEN)?,
+                unique,
+            },
+            phase: IndexPhase::from_byte(bytes[35])?,
+            backfill_done: done,
+            progress: u128::from_be_bytes(progress),
+        })
     }
 }
 
@@ -313,6 +405,8 @@ impl GraphStore {
                 },
             });
             batch.record(pizzlydb_core::GraphMutation::IndexReady { namespace, index });
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::INDEX_START)?;
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::INDEX_READY)?;
             Ok(index)
         })
     }
@@ -345,6 +439,17 @@ impl GraphStore {
     /// # Ok(())
     /// # }
     /// ```
+    pub fn index_state<R: KeyRead>(
+        &self,
+        read: &R,
+        index: IndexId,
+    ) -> Result<IndexState, GraphError> {
+        let bytes = read
+            .get(&keys::index_definition(self.namespace(), index))?
+            .ok_or(GraphError::InvalidIdentity)?;
+        IndexState::decode(&bytes)
+    }
+
     pub fn index<R: KeyRead>(
         &self,
         read: &R,
@@ -452,9 +557,9 @@ impl GraphStore {
 
     /// Owners whose indexed value is within `lower` and `upper`.
     ///
-    /// Bounds compare in index order: by value type tag (null, bool, int,
-    /// float, string, bytes) and then by value, so a range between two
-    /// integers yields only integers.
+    /// Bounds compare in index order. Integers, floats, and decimals share one
+    /// numeric order, so a range that starts at an integer includes floats in
+    /// that numeric span.
     ///
     /// # Errors
     ///
@@ -505,7 +610,15 @@ impl GraphStore {
         lower: Bound<&Value>,
         upper: Bound<&Value>,
     ) -> Result<IndexScan<'r, R>, GraphError> {
-        let definition = self.index(read, index)?;
+        let state = self.index_state(read, index)?;
+        if state.phase != IndexPhase::Ready {
+            return Err(if state.phase == IndexPhase::Building {
+                GraphError::IndexNotReady
+            } else {
+                GraphError::NotFound
+            });
+        }
+        let definition = state.definition;
         let lower = encode_bound(lower)?;
         let upper = encode_bound(upper)?;
         let prefix = keys::index_entries(self.namespace(), index, definition.unique);
@@ -601,6 +714,310 @@ impl GraphStore {
         edge_type: TypeId,
     ) -> Result<IdScan<'r, R, EdgeId>, GraphError> {
         IdScan::new(read, keys::type_members(self.namespace(), edge_type))
+    }
+
+    /// Register an index as [`IndexPhase::Building`] without scanning members.
+    ///
+    /// Later [`Self::backfill_index`] calls fill it. [`Self::finish_index`]
+    /// marks it ready. Writes that touch a member maintain the index from the
+    /// moment this call commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the identity and storage errors of [`Self::create_index`].
+    pub fn start_index<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        scope: Scope,
+        key: PropertyKeyId,
+        unique: bool,
+    ) -> Result<IndexId, GraphError> {
+        let namespace = self.namespace();
+        self.ensure(batch)?;
+        scope.ensure_issued(batch, namespace)?;
+        catalog::ensure_issued(batch, namespace, key)?;
+        if let Some(index) = self.find_index(batch, scope, key, unique)? {
+            return Ok(index);
+        }
+        batch.atomic(|batch| {
+            let index = directory::allocate(batch, namespace, id_kind::INDEX)?;
+            let state = IndexState {
+                definition: IndexDefinition { scope, key, unique },
+                phase: IndexPhase::Building,
+                backfill_done: false,
+                progress: 0,
+            };
+            batch.put(keys::index_definition(namespace, index), state.encode())?;
+            batch.put(
+                keys::index_target(namespace, scope, key, unique),
+                index.as_bytes().to_vec(),
+            )?;
+            batch.record(pizzlydb_core::GraphMutation::IndexCreate {
+                namespace,
+                index,
+                definition: pizzlydb_core::IndexImage {
+                    scope_kind: scope.kind(),
+                    scope: *scope.id_bytes(),
+                    property: key,
+                    unique,
+                },
+            });
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::INDEX_START)?;
+            Ok(index)
+        })
+    }
+
+    /// Index up to `limit` members that backfill has not visited.
+    ///
+    /// Returns `true` when every current member has been visited. A duplicate
+    /// in a unique index returns [`GraphError::DuplicateValues`] and does not
+    /// advance the cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::InvalidIdentity`] for an unknown index and
+    /// [`GraphError::DuplicateValues`] when a unique value is repeated.
+    pub fn backfill_index<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        index: IndexId,
+        limit: u32,
+    ) -> Result<bool, GraphError> {
+        let namespace = self.namespace();
+        self.ensure(batch)?;
+        let state = self.index_state(batch, index)?;
+        if state.phase != IndexPhase::Building {
+            return Ok(state.phase == IndexPhase::Ready || state.backfill_done);
+        }
+        if state.backfill_done {
+            return Ok(true);
+        }
+        let prefix = member_prefix(namespace, state.definition.scope);
+        let start = if state.progress == 0 {
+            prefix.clone()
+        } else {
+            let mut cursor = prefix.clone();
+            cursor.extend_from_slice(&state.progress.to_be_bytes());
+            cursor.push(0);
+            cursor
+        };
+        let end = keys::prefix_end(&prefix).ok_or(GraphError::Corrupt)?;
+        let cap = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+        let (rows, truncated) = batch.scan_capped(&start, &end, cap)?;
+        batch.atomic(|batch| {
+            let mut progress = state.progress;
+            let target = Target {
+                index,
+                key: state.definition.key,
+                unique: state.definition.unique,
+            };
+            for (key, _) in &rows {
+                if key.len() < 16 {
+                    return Err(GraphError::Corrupt);
+                }
+                let owner = member_owner(state.definition.scope, &key[key.len() - 16..])?;
+                progress = u128::from_be_bytes(
+                    owner
+                        .id_bytes()
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| GraphError::Corrupt)?,
+                );
+                if let Some(value) = property::read_cell(batch, namespace, owner, target.key)? {
+                    insert_or_duplicate(batch, namespace, &target, owner, &value)?;
+                }
+            }
+            let done = !truncated;
+            let stored = IndexState {
+                progress,
+                backfill_done: done,
+                ..state
+            };
+            batch.put(keys::index_definition(namespace, index), stored.encode())?;
+            Ok(done)
+        })
+    }
+
+    /// Mark a finished build ready and bump the schema version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::IndexNotReady`] when backfill has not finished.
+    pub fn finish_index<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        index: IndexId,
+    ) -> Result<(), GraphError> {
+        let namespace = self.namespace();
+        self.ensure(batch)?;
+        let state = self.index_state(batch, index)?;
+        if state.phase == IndexPhase::Ready {
+            return Ok(());
+        }
+        if state.phase != IndexPhase::Building || !state.backfill_done {
+            return Err(GraphError::IndexNotReady);
+        }
+        let stored = IndexState {
+            phase: IndexPhase::Ready,
+            ..state
+        };
+        batch.atomic(|batch| {
+            batch.put(keys::index_definition(namespace, index), stored.encode())?;
+            batch.record(pizzlydb_core::GraphMutation::IndexReady { namespace, index });
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::INDEX_READY)?;
+            Ok(())
+        })
+    }
+
+    /// Stop maintaining `index` and record the drop. Entries are removed by
+    /// [`Self::reclaim_index`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::InvalidIdentity`] when `index` was not issued.
+    pub fn drop_index<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        index: IndexId,
+    ) -> Result<(), GraphError> {
+        let namespace = self.namespace();
+        self.ensure(batch)?;
+        let state = self.index_state(batch, index)?;
+        if matches!(state.phase, IndexPhase::Dropping | IndexPhase::Dropped) {
+            return Ok(());
+        }
+        let stored = IndexState {
+            phase: IndexPhase::Dropping,
+            backfill_done: false,
+            ..state
+        };
+        batch.atomic(|batch| {
+            batch.put(keys::index_definition(namespace, index), stored.encode())?;
+            batch.delete(keys::index_target(
+                namespace,
+                state.definition.scope,
+                state.definition.key,
+                state.definition.unique,
+            ))?;
+            batch.record(pizzlydb_core::GraphMutation::IndexDrop {
+                namespace,
+                index,
+                definition: pizzlydb_core::IndexImage {
+                    scope_kind: state.definition.scope.kind(),
+                    scope: *state.definition.scope.id_bytes(),
+                    property: state.definition.key,
+                    unique: state.definition.unique,
+                },
+            });
+            crate::schema::bump(batch, namespace, pizzlydb_core::schema_change::INDEX_DROP)?;
+            Ok(())
+        })
+    }
+
+    /// Delete up to `max_keys` entries of a dropping index.
+    ///
+    /// Returns `true` when the index is a tombstone and has no entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::InvalidIdentity`] for an unknown index and
+    /// [`GraphError::IndexNotReady`] when the index is not dropping or dropped.
+    pub fn reclaim_index<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        index: IndexId,
+        max_keys: u32,
+    ) -> Result<bool, GraphError> {
+        let namespace = self.namespace();
+        self.ensure(batch)?;
+        let state = self.index_state(batch, index)?;
+        if state.phase == IndexPhase::Dropped {
+            return Ok(true);
+        }
+        if state.phase != IndexPhase::Dropping {
+            return Err(GraphError::IndexNotReady);
+        }
+        let prefix = keys::index_entries(namespace, index, state.definition.unique);
+        let end = keys::prefix_end(&prefix).ok_or(GraphError::Corrupt)?;
+        let cap = usize::try_from(max_keys.max(1)).unwrap_or(usize::MAX);
+        let (rows, truncated) = batch.scan_capped(&prefix, &end, cap)?;
+        batch.atomic(|batch| {
+            for (key, _) in &rows {
+                batch.delete(key.clone())?;
+            }
+            if truncated {
+                return Ok(false);
+            }
+            let stored = IndexState {
+                phase: IndexPhase::Dropped,
+                backfill_done: false,
+                progress: 0,
+                ..state
+            };
+            batch.put(keys::index_definition(namespace, index), stored.encode())?;
+            Ok(true)
+        })
+    }
+
+    /// Phase and backfill cursor of an index.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::index_state`].
+    pub fn index_progress<R: KeyRead>(
+        &self,
+        read: &R,
+        index: IndexId,
+    ) -> Result<IndexProgress, GraphError> {
+        let state = self.index_state(read, index)?;
+        Ok(IndexProgress {
+            phase: state.phase,
+            progress: state.progress,
+            backfill_done: state.backfill_done,
+        })
+    }
+}
+
+fn member_prefix(namespace: NamespaceId, scope: Scope) -> Vec<u8> {
+    match scope {
+        Scope::Label(label) => keys::label_members(namespace, label),
+        Scope::Type(edge_type) => keys::type_members(namespace, edge_type),
+    }
+}
+
+fn member_owner(scope: Scope, bytes: &[u8]) -> Result<Owner, GraphError> {
+    match scope {
+        Scope::Label(_) => Ok(Owner::Node(id_at(bytes, 0)?)),
+        Scope::Type(_) => Ok(Owner::Edge(id_at(bytes, 0)?)),
+    }
+}
+
+fn insert_or_duplicate<V: Vfs>(
+    batch: &mut GraphTxn<V>,
+    namespace: NamespaceId,
+    target: &Target,
+    owner: Owner,
+    value: &Value,
+) -> Result<(), GraphError> {
+    if target.unique && *value != Value::Null {
+        let key = entry_key(namespace, target, owner, value)?;
+        if let Some(holder) = batch.get(&key)?
+            && holder.as_slice() != owner.id_bytes().as_slice()
+        {
+            let mut other = [0_u8; ID_LEN];
+            if holder.len() == ID_LEN {
+                other.copy_from_slice(&holder);
+            }
+            return Err(GraphError::DuplicateValues {
+                owners: vec![other, *owner.id_bytes()],
+            });
+        }
+    }
+    match insert_entry(batch, namespace, target, owner, value) {
+        Err(GraphError::UniqueConflict) => Err(GraphError::DuplicateValues {
+            owners: vec![*owner.id_bytes()],
+        }),
+        other => other,
     }
 }
 
@@ -871,7 +1288,7 @@ mod tests {
         }
         .encode();
         let mut cases = vec![Vec::new(), valid[..valid.len() - 1].to_vec()];
-        for (at, byte) in [(0, 2), (1, 3), (valid.len() - 1, 2)] {
+        for (at, byte) in [(0_usize, 2_u8), (1, 3), (34, 2), (35, 9), (36, 2)] {
             let mut bad = valid.clone();
             bad[at] = byte;
             cases.push(bad);

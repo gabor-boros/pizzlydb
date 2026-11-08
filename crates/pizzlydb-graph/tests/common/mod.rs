@@ -57,7 +57,7 @@ pub fn count_kind(read: &impl KeyRead, kind: u8) -> usize {
 /// Undeclared cell key of a node property, built from the documented layout.
 pub fn undeclared_node_cell(graph: &GraphStore, node: &[u8; 16], key: PropertyKeyId) -> Vec<u8> {
     let mut out = graph.namespace().to_bytes().to_vec();
-    out.extend_from_slice(&[UNDECLARED_CELL, 1]);
+    out.extend_from_slice(&[DECLARED_CELL, 1]);
     out.extend_from_slice(node);
     out.extend_from_slice(key.as_bytes());
     out

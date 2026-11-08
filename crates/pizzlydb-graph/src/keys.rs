@@ -17,14 +17,15 @@
 //! - `0x09` type member: `type || edge` to an empty value.
 //! - `0x0A` declaration: `scope_kind || scope || property_key` to a
 //!   declaration.
-//! - `0x0B` declared cell and `0x0C` undeclared cell:
-//!   `owner_kind || owner || property_key` to a cell value.
+//! - `0x0B` property cell: `owner_kind || owner || property_key` to a cell
+//!   value. Kind `0x0C` is reserved and unused.
 //! - `0x0D` index definition: `index` to a definition.
 //! - `0x0E` index target: `scope_kind || scope || property_key || unique` to
 //!   the index id.
 //! - `0x0F` unique entry: `index || value` to the owner id.
 //! - `0x10` property index entry: `index || value || owner` to an empty
 //!   value.
+//! - `0x11` schema version: no further fields, value is a big-endian `u64`.
 
 use pizzlydb_core::{
     EdgeId, ID_LEN, IndexId, KeyBuf, LabelId, NamespaceId, NodeId, PropertyKeyId, TypeId, Value,
@@ -60,10 +61,12 @@ const TYPE_MEMBER: u8 = 0x09;
 const DECLARATION: u8 = 0x0A;
 const DECLARED_CELL: u8 = 0x0B;
 const UNDECLARED_CELL: u8 = 0x0C;
+const _: u8 = UNDECLARED_CELL;
 const INDEX_DEFINITION: u8 = 0x0D;
 const INDEX_TARGET: u8 = 0x0E;
 const UNIQUE_ENTRY: u8 = 0x0F;
 const PROPERTY_ENTRY: u8 = 0x10;
+const SCHEMA: u8 = 0x11;
 
 /// Offset of the first field after the namespace and kind prefix.
 const BODY: usize = KeyBuf::PREFIX_LEN;
@@ -207,28 +210,34 @@ pub(crate) fn declaration(
     key.into_vec()
 }
 
-pub(crate) fn cell(
-    namespace: NamespaceId,
-    declared: bool,
-    owner: Owner,
-    property: PropertyKeyId,
-) -> Vec<u8> {
-    let mut key = cells(namespace, declared, owner);
+pub(crate) fn cell(namespace: NamespaceId, owner: Owner, property: PropertyKeyId) -> Vec<u8> {
+    let mut key = cells(namespace, owner);
     key.extend_from_slice(property.as_bytes());
     key
 }
 
-/// Prefix of every cell of one kind owned by `owner`.
-pub(crate) fn cells(namespace: NamespaceId, declared: bool, owner: Owner) -> Vec<u8> {
-    let kind = if declared {
-        DECLARED_CELL
-    } else {
-        UNDECLARED_CELL
-    };
-
-    let mut key = KeyBuf::new(namespace, kind);
+/// Prefix of every property cell owned by `owner`.
+pub(crate) fn cells(namespace: NamespaceId, owner: Owner) -> Vec<u8> {
+    let mut key = KeyBuf::new(namespace, DECLARED_CELL);
     key.push_u8(owner.kind()).push_bytes(owner.id_bytes());
     key.into_vec()
+}
+
+/// Key of the namespace schema version. The value is a big-endian `u64`.
+pub(crate) fn schema_version(namespace: NamespaceId) -> Vec<u8> {
+    KeyBuf::new(namespace, SCHEMA).into_vec()
+}
+
+/// Exclusive end of a prefix, or [`None`] when `prefix` is empty or all `0xff`.
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(byte) = end.pop() {
+        if byte < u8::MAX {
+            end.push(byte + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 pub(crate) fn index_definition(namespace: NamespaceId, index: IndexId) -> Vec<u8> {

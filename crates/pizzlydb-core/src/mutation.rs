@@ -26,6 +26,8 @@ const INDEX_READY: u8 = 13;
 const INDEX_DROP: u8 = 14;
 const NAMESPACE_CREATE: u8 = 15;
 const NAMESPACE_DROP: u8 = 16;
+const SCHEMA_CHANGED: u8 = 17;
+const NAMESPACE_RENAME: u8 = 18;
 
 const OWNER_NODE: u8 = 1;
 const OWNER_EDGE: u8 = 2;
@@ -48,6 +50,23 @@ pub mod catalog_kind {
     pub const INDEX: u8 = 6;
 }
 
+/// Kind of a [`GraphMutation::SchemaChanged`] record.
+pub mod schema_change {
+    /// A catalog name was created.
+    pub const CATALOG: u8 = 1;
+    /// A catalog name was renamed.
+    pub const RENAME: u8 = 2;
+    /// A property declaration was added or replaced.
+    pub const DECLARATION: u8 = 3;
+    /// A property declaration was removed.
+    pub const UNDECLARE: u8 = 4;
+    /// An index build started.
+    pub const INDEX_START: u8 = 5;
+    /// An index became ready.
+    pub const INDEX_READY: u8 = 6;
+    /// An index started dropping.
+    pub const INDEX_DROP: u8 = 7;
+}
 /// Scope kind stored on an index or declaration mutation.
 pub mod scope_kind {
     /// Label scope.
@@ -63,6 +82,8 @@ pub struct DeclarationImage {
     pub value_type: ValueType,
     /// Whether [`Value::Null`](crate::Value::Null) is accepted.
     pub nullable: bool,
+    /// Whether the property must be present at commit.
+    pub required: bool,
 }
 
 /// Before-image of an index definition.
@@ -248,6 +269,24 @@ pub enum GraphMutation {
         /// Registry name before the drop.
         name: Vec<u8>,
     },
+    /// The per-namespace schema version changed.
+    SchemaChanged {
+        /// Namespace whose schema changed.
+        namespace: NamespaceId,
+        /// Schema version after the change.
+        version: u64,
+        /// [`schema_change`] code.
+        kind: u8,
+    },
+    /// A namespace was renamed.
+    NamespaceRename {
+        /// Renamed namespace.
+        namespace: NamespaceId,
+        /// Previous name.
+        previous: Vec<u8>,
+        /// New name.
+        name: Vec<u8>,
+    },
 }
 
 impl GraphMutation {
@@ -270,7 +309,9 @@ impl GraphMutation {
             | Self::IndexReady { namespace, .. }
             | Self::IndexDrop { namespace, .. }
             | Self::NamespaceCreate { namespace, .. }
-            | Self::NamespaceDrop { namespace, .. } => *namespace,
+            | Self::NamespaceDrop { namespace, .. }
+            | Self::SchemaChanged { namespace, .. }
+            | Self::NamespaceRename { namespace, .. } => *namespace,
         }
     }
 }
@@ -448,6 +489,26 @@ pub fn encode_mutation(mutation: &GraphMutation) -> Result<Vec<u8>, CoreError> {
             put_id(&mut out, namespace);
             put_bytes(&mut out, name)?;
         }
+        GraphMutation::SchemaChanged {
+            namespace,
+            version,
+            kind,
+        } => {
+            out.push(SCHEMA_CHANGED);
+            put_id(&mut out, namespace);
+            out.extend_from_slice(&version.to_be_bytes());
+            out.push(*kind);
+        }
+        GraphMutation::NamespaceRename {
+            namespace,
+            previous,
+            name,
+        } => {
+            out.push(NAMESPACE_RENAME);
+            put_id(&mut out, namespace);
+            put_bytes(&mut out, previous)?;
+            put_bytes(&mut out, name)?;
+        }
     }
     Ok(out)
 }
@@ -559,6 +620,16 @@ pub fn decode_mutation(bytes: &[u8]) -> Result<(GraphMutation, usize), CoreError
             namespace: cur.namespace()?,
             name: cur.bytes()?,
         },
+        SCHEMA_CHANGED => GraphMutation::SchemaChanged {
+            namespace: cur.namespace()?,
+            version: cur.u64()?,
+            kind: cur.u8()?,
+        },
+        NAMESPACE_RENAME => GraphMutation::NamespaceRename {
+            namespace: cur.namespace()?,
+            previous: cur.bytes()?,
+            name: cur.bytes()?,
+        },
         _ => return Err(CoreError::InvalidMutation),
     };
     Ok((mutation, cur.at))
@@ -657,6 +728,7 @@ fn put_optional_value(out: &mut Vec<u8>, value: Option<&Value>) -> Result<(), Co
 fn put_declaration(out: &mut Vec<u8>, image: &DeclarationImage) {
     out.push(image.value_type.tag());
     out.push(u8::from(image.nullable));
+    out.push(u8::from(image.required));
 }
 
 fn put_optional_declaration(
@@ -716,6 +788,13 @@ impl<'a> Cursor<'a> {
     fn u32(&mut self) -> Result<u32, CoreError> {
         let bytes = self.take(4)?;
         Ok(u32::from_be_bytes(
+            bytes.try_into().map_err(|_| CoreError::Truncated)?,
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, CoreError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_be_bytes(
             bytes.try_into().map_err(|_| CoreError::Truncated)?,
         ))
     }
@@ -805,10 +884,16 @@ impl<'a> Cursor<'a> {
                     1 => true,
                     _ => return Err(CoreError::InvalidMutation),
                 };
+                let required = match self.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(CoreError::InvalidMutation),
+                };
                 let value_type = ValueType::from_tag(tag)?;
                 Ok(Some(DeclarationImage {
                     value_type,
                     nullable,
+                    required,
                 }))
             }
             _ => Err(CoreError::InvalidMutation),
@@ -843,7 +928,7 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::{
         DeclarationImage, GraphMutation, IndexImage, catalog_kind, decode_mutation_list,
-        encode_mutation, encode_mutation_list, scope_kind,
+        encode_mutation, encode_mutation_list, schema_change, scope_kind,
     };
     use crate::error::CoreError;
     use crate::id::{EdgeId, IndexId, LabelId, NamespaceId, NodeId, PropertyKeyId, TypeId};
@@ -872,6 +957,7 @@ mod tests {
         let declaration = DeclarationImage {
             value_type: crate::value::ValueType::Int,
             nullable: false,
+            required: true,
         };
         vec![
             GraphMutation::NodeCreate { namespace, node },
@@ -962,6 +1048,16 @@ mod tests {
             GraphMutation::NamespaceDrop {
                 namespace,
                 name: b"main".to_vec(),
+            },
+            GraphMutation::SchemaChanged {
+                namespace,
+                version: 3,
+                kind: schema_change::DECLARATION,
+            },
+            GraphMutation::NamespaceRename {
+                namespace,
+                previous: b"main".to_vec(),
+                name: b"tenant".to_vec(),
             },
         ]
     }

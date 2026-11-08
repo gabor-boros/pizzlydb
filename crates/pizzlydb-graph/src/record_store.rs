@@ -1,5 +1,7 @@
 //! Node and edge create, read, and delete.
 
+use std::collections::BTreeSet;
+
 use pizzlydb_core::{EdgeId, GraphMutation, NamespaceId, NodeId, TypeId};
 use pizzlydb_storage::Vfs;
 
@@ -11,7 +13,12 @@ use crate::property::Owner;
 use crate::record::{EdgeRecord, NodeRecord, encode_edge, encode_node, encode_tombstone};
 use crate::{adjacency, catalog, constraint, directory, index, property};
 
-/// Graph operations scoped to one namespace.
+/// Limits for [`GraphStore::detach_delete_node`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DetachLimits {
+    /// Maximum incident edges removed by one call. Self-loops count once.
+    pub max_edges: u64,
+}
 ///
 /// A `GraphStore` holds no state besides its namespace. Read methods take any
 /// [`KeyRead`]: a committed [`ReadView`](pizzlydb_storage::ReadView) or an
@@ -46,6 +53,7 @@ use crate::{adjacency, catalog, constraint, directory, index, property};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GraphStore {
     namespace: NamespaceId,
+    checked: bool,
 }
 
 impl GraphStore {
@@ -65,7 +73,27 @@ impl GraphStore {
     /// ```
     #[must_use]
     pub const fn new(namespace: NamespaceId) -> Self {
-        Self { namespace }
+        Self {
+            namespace,
+            checked: false,
+        }
+    }
+
+    pub(crate) const fn checked(namespace: NamespaceId) -> Self {
+        Self {
+            namespace,
+            checked: true,
+        }
+    }
+
+    pub(crate) fn ensure<R: crate::access::KeyRead>(&self, read: &R) -> Result<(), GraphError> {
+        if !self.checked {
+            return Ok(());
+        }
+        match crate::namespace::load(read, self.namespace)?.state {
+            crate::namespace::NamespaceState::Active => Ok(()),
+            crate::namespace::NamespaceState::Dropping => Err(GraphError::NamespaceDropping),
+        }
     }
 
     /// Namespace of every key this store reads and writes.
@@ -227,6 +255,37 @@ impl GraphStore {
         })
     }
 
+    /// Delete `id` and every incident edge.
+    ///
+    /// Self-loops are counted once. Edge deletes are recorded before the node
+    /// delete, in edge-id order. The adjacency prefix is in the read set, so
+    /// an edge created concurrently conflicts instead of remaining behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphError::TooManyIncidentEdges`] when the node has more
+    /// incident edges than `limits.max_edges`. Nothing is staged in that case.
+    /// Returns [`GraphError::NotFound`] or [`GraphError::Deleted`] when the
+    /// node is not live.
+    pub fn detach_delete_node<V: Vfs>(
+        &self,
+        batch: &mut GraphTxn<V>,
+        id: NodeId,
+        limits: DetachLimits,
+    ) -> Result<u64, GraphError> {
+        self.ensure(batch)?;
+        batch.atomic(|batch| {
+            directory::load_node(batch, self.namespace, id)?;
+            let edges = incident_edges(batch, self.namespace, id, limits.max_edges)?;
+            let removed = u64::try_from(edges.len()).unwrap_or(u64::MAX);
+            for edge in edges {
+                self.delete_edge(batch, edge)?;
+            }
+            self.delete_node(batch, id)?;
+            Ok(removed)
+        })
+    }
+
     /// Create a directed edge from `source` to `target`.
     ///
     /// The edge record, both adjacency keys, and the relationship-type
@@ -299,6 +358,7 @@ impl GraphStore {
                 target,
                 edge_type,
             });
+            batch.note_owner(self.namespace, Owner::Edge(id));
             Ok(id)
         })
     }
@@ -403,4 +463,30 @@ impl GraphStore {
             Ok(())
         })
     }
+}
+
+fn incident_edges<V: Vfs>(
+    batch: &mut GraphTxn<V>,
+    namespace: NamespaceId,
+    node: NodeId,
+    max_edges: u64,
+) -> Result<Vec<EdgeId>, GraphError> {
+    let prefix = keys::adjacency_of(namespace, node);
+    let end = keys::prefix_end(&prefix).ok_or(GraphError::Corrupt)?;
+    let cap = usize::try_from(max_edges.saturating_add(1)).unwrap_or(usize::MAX);
+    let (rows, truncated) = batch.scan_capped(&prefix, &end, cap)?;
+    if truncated || u64::try_from(rows.len()).unwrap_or(u64::MAX) > max_edges {
+        return Err(GraphError::TooManyIncidentEdges {
+            limit: max_edges,
+            found_at_least: max_edges.saturating_add(1),
+        });
+    }
+    let mut ids = BTreeSet::new();
+    for (key, _) in rows {
+        if key.len() != keys::ADJACENCY_LEN {
+            return Err(GraphError::Corrupt);
+        }
+        ids.insert(crate::access::id_at::<EdgeId>(&key, keys::ADJACENCY_EDGE)?);
+    }
+    Ok(ids.into_iter().collect())
 }

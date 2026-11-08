@@ -2,7 +2,7 @@
 
 A request for comments (RFC) proposes a behavior-changing capability before it is treated as a project decision. Guide [§14](../architecture/implementation-guide.md#14-mandatory-adrrfc-process) defines when an RFC is required. An [ADR](../adr/README.md) freezes the resulting choice.
 
-No RFCs exist yet. The roadmap's decision issues write the first ones; [Appendix E](../roadmap/README.md#appendix-e-open-decisions) lists the open decisions.
+No RFCs were open when this directory was created. Accepted requests start at [0001](0001-type-system.md).
 
 ## Status values
 

@@ -602,22 +602,19 @@ fn copy_properties<R: KeyRead, V: Vfs>(
 ) -> Result<(), GraphError> {
     let (src, dst, entity) = ends;
     let mut found = Vec::new();
-    for declared in [true, false] {
-        let scan =
-            IdScan::<_, PropertyKeyId>::new(source, keys::cells(graph.namespace(), declared, src))?;
-        for key in scan {
-            match key {
-                Ok(key) => found.push(key),
-                Err(GraphError::Storage(err)) => return Err(GraphError::Storage(err)),
-                Err(_) => {
-                    omit(
-                        report,
-                        OmissionKind::Property,
-                        entity,
-                        OmissionReason::Corrupt,
-                    );
-                    return Ok(());
-                }
+    let scan = IdScan::<_, PropertyKeyId>::new(source, keys::cells(graph.namespace(), src))?;
+    for key in scan {
+        match key {
+            Ok(key) => found.push(key),
+            Err(GraphError::Storage(err)) => return Err(GraphError::Storage(err)),
+            Err(_) => {
+                omit(
+                    report,
+                    OmissionKind::Property,
+                    entity,
+                    OmissionReason::Corrupt,
+                );
+                return Ok(());
             }
         }
     }

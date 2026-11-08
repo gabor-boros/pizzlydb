@@ -202,6 +202,8 @@ pub struct Txn<V: Vfs> {
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     merges: BTreeMap<Vec<u8>, i64>,
     ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Offsets of `u64` commit-sequence stamps inside staged values.
+    stamps: BTreeMap<Vec<u8>, usize>,
     undo: Option<UndoLog>,
     read_only: bool,
     allow_client_ids: bool,
@@ -276,6 +278,7 @@ impl<V: Vfs> TxnManager<V> {
             writes: BTreeMap::new(),
             merges: BTreeMap::new(),
             ranges: Vec::new(),
+            stamps: BTreeMap::new(),
             undo: None,
             read_only: options.read_only,
             allow_client_ids: options.allow_client_ids,
@@ -574,6 +577,115 @@ impl<V: Vfs> Txn<V> {
         self.lookup(key, false)
     }
 
+    /// Copy a snapshot value, ignoring staged writes and the read set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::Expired`], [`TxnError::SnapshotTooOld`], or
+    /// [`TxnError::Storage`].
+    pub fn snapshot_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
+        self.check_open()?;
+        self.view.get(key).map_err(map_storage)
+    }
+
+    /// Visit staged keys. `None` is a delete.
+    pub fn for_each_staged(&self, mut visit: impl FnMut(&[u8], Option<&[u8]>)) {
+        for (key, value) in &self.writes {
+            visit(key, value.as_deref());
+        }
+    }
+
+    /// At commit, write this transaction's [`CommitSeq`](pizzlydb_core::CommitSeq)
+    /// into the staged value at `key`, as a big-endian `u64` at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TxnError::Closed`] or [`TxnError::Expired`].
+    pub fn stamp_commit(&mut self, key: &[u8], offset: usize) -> Result<(), TxnError> {
+        self.check_open()?;
+        self.stamps.insert(key.to_vec(), offset);
+        Ok(())
+    }
+
+    /// Keys in `[start, end)`, at most `cap` visible rows.
+    ///
+    /// The whole range is recorded in the read set. `truncated` is set when
+    /// another visible row exists past `cap`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::scan_range`].
+    pub fn scan_capped(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        cap: usize,
+    ) -> Result<(Vec<Row>, bool), TxnError> {
+        self.check_open()?;
+        self.reads
+            .borrow_mut()
+            .add_range(start, Some(end), self.limits.max_read_set)?;
+        let mut base = self
+            .view
+            .scan_range(Some(start), Some(end), Direction::Forward)
+            .map_err(map_storage)?;
+        let staged: Vec<(&Vec<u8>, &Option<Vec<u8>>)> = self
+            .writes
+            .range(start.to_vec()..)
+            .take_while(|(key, _)| key.as_slice() < end)
+            .collect();
+        let mut rows = Vec::new();
+        let mut base_next = next_row(&mut base)?;
+        let mut staged_at = 0;
+        let mut truncated = false;
+        loop {
+            if rows.len() > cap {
+                truncated = true;
+                rows.pop();
+                break;
+            }
+            let base_key = base_next.as_ref().map(|(key, _)| key.as_slice());
+            let staged_key = staged.get(staged_at).map(|(key, _)| key.as_slice());
+            match (base_key, staged_key) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    if let Some(row) = base_next.take() {
+                        rows.push(row);
+                    }
+                    base_next = next_row(&mut base)?;
+                }
+                (None, Some(_)) => {
+                    if let Some(value) = staged[staged_at].1.as_ref() {
+                        rows.push((staged[staged_at].0.clone(), value.clone()));
+                    }
+                    staged_at += 1;
+                }
+                (Some(left), Some(right)) => match left.cmp(right) {
+                    std::cmp::Ordering::Less => {
+                        if let Some(row) = base_next.take() {
+                            rows.push(row);
+                        }
+                        base_next = next_row(&mut base)?;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if let Some(value) = staged[staged_at].1.as_ref() {
+                            rows.push((staged[staged_at].0.clone(), value.clone()));
+                        }
+                        staged_at += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        base_next = next_row(&mut base)?;
+                        if let Some(value) = staged[staged_at].1.as_ref() {
+                            rows.push((staged[staged_at].0.clone(), value.clone()));
+                        }
+                        staged_at += 1;
+                    }
+                },
+            }
+        }
+        Ok((rows, truncated))
+    }
+
     /// Keys in `[start, end)`, merged with staged writes. The range is recorded.
     ///
     /// `end` of [`None`] reads through the end of the map.
@@ -798,7 +910,13 @@ impl<V: Vfs> Txn<V> {
         let mut batch = self.shared.storage.begin_write().map_err(map_storage)?;
         for (key, value) in &self.writes {
             match value {
-                Some(bytes) => batch.put(key, bytes).map_err(map_storage)?,
+                Some(bytes) => {
+                    if let Some(stamped) = self.stamped(key, bytes, seq)? {
+                        batch.put(key, &stamped).map_err(map_storage)?;
+                    } else {
+                        batch.put(key, bytes).map_err(map_storage)?;
+                    }
+                }
                 None => batch.delete(key).map_err(map_storage)?,
             }
         }
@@ -1068,6 +1186,23 @@ impl<V: Vfs> Txn<V> {
         Ok(())
     }
 
+    fn stamped(
+        &self,
+        key: &[u8],
+        bytes: &[u8],
+        seq: CommitSeq,
+    ) -> Result<Option<Vec<u8>>, TxnError> {
+        let Some(&offset) = self.stamps.get(key) else {
+            return Ok(None);
+        };
+        if offset.checked_add(8).is_none_or(|end| end > bytes.len()) {
+            return Err(TxnError::Corrupt);
+        }
+        let mut owned = bytes.to_vec();
+        owned[offset..offset + 8].copy_from_slice(&seq.to_be_bytes());
+        Ok(Some(owned))
+    }
+
     fn unregister(&mut self) {
         if let Some(id) = self.active_id.take() {
             self.shared.state.lock().expect("txn").active.remove(&id);
@@ -1114,6 +1249,13 @@ impl<V: Vfs> Shared<V> {
             next_txn: AtomicU64::new(1),
             next_floor: AtomicU64::new(next_floor),
         })
+    }
+}
+
+fn next_row<V: Vfs>(scan: &mut pizzlydb_storage::Scan<'_, V>) -> Result<Option<Row>, TxnError> {
+    match scan.next() {
+        Some(row) => row.map(Some).map_err(map_storage),
+        None => Ok(None),
     }
 }
 

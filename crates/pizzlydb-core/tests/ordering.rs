@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use pizzlydb_core::{
     KeyBuf, NamespaceId, NodeId, Value, decode_value, decode_value_key, encode_f64_key,
-    encode_i64_key, encode_value, encode_value_key,
+    encode_i64_key, encode_value, encode_value_key, index_cmp,
 };
 
 struct SplitMix64(u64);
@@ -181,8 +181,31 @@ fn tuples_with_a_trailing_id_sort_like_rust_tuples() {
 }
 
 #[test]
-fn null_sorts_first_and_types_order_by_tag() {
-    let ordered = [
+fn null_sorts_first_and_numbers_share_one_order() {
+    let key_order = [
+        Value::Null,
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::Float(f64::NEG_INFINITY),
+        Value::Int(i64::MIN),
+        Value::Int(i64::MAX),
+        Value::Float(f64::INFINITY),
+        Value::from(""),
+        Value::from("\u{10FFFF}"),
+        Value::Bytes(vec![]),
+        Value::Bytes(vec![0xFF; 4]),
+    ];
+    for pair in key_order.windows(2) {
+        assert_eq!(
+            value_key(&pair[0]).cmp(&value_key(&pair[1])),
+            Ordering::Less,
+            "{:?} vs {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    let cell_order = [
         Value::Null,
         Value::Bool(false),
         Value::Bool(true),
@@ -195,12 +218,13 @@ fn null_sorts_first_and_types_order_by_tag() {
         Value::Bytes(vec![]),
         Value::Bytes(vec![0xFF; 4]),
     ];
-    for pair in ordered.windows(2) {
-        assert_eq!(
-            value_key(&pair[0]).cmp(&value_key(&pair[1])),
-            Ordering::Less
+    for pair in cell_order.windows(2) {
+        assert!(
+            encode_value(&pair[0]).unwrap() < encode_value(&pair[1]).unwrap(),
+            "{:?} vs {:?}",
+            pair[0],
+            pair[1]
         );
-        assert!(encode_value(&pair[0]).unwrap() < encode_value(&pair[1]).unwrap());
     }
 }
 
@@ -249,7 +273,9 @@ fn round_trips_hold_for_random_values() {
             Ok(value.clone())
         );
         let key = value_key(&value);
-        assert_eq!(decode_value_key(&key), Ok((value, key.len())));
+        let (decoded, used) = decode_value_key(&key).unwrap();
+        assert_eq!(used, key.len());
+        assert_eq!(index_cmp(&decoded, &value), Ordering::Equal);
     }
 }
 

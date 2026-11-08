@@ -3,9 +3,9 @@
 //! [`NodeId`], [`EdgeId`], and the other identifier types are opaque 128-bit
 //! values. Zero is invalid. [`Value`] is the scalar set stored in a property.
 //! [`encode_value`] writes the stored form of a value, and
-//! [`encode_value_key`], [`encode_i64_key`], and [`encode_f64_key`] write
-//! bytes whose unsigned order equals value order. [`KeyBuf`] builds keys that
-//! start with a namespace and a kind tag.
+//! [`encode_value_key`] writes bytes whose unsigned order equals
+//! [`index_cmp`]. Integers, floats, and decimals share one numeric order.
+//! [`KeyBuf`] builds keys that start with a namespace and a kind tag.
 //!
 //! This crate has no database-module dependencies.
 //!
@@ -31,7 +31,9 @@ mod error;
 mod id;
 mod key;
 mod mutation;
+mod numeric;
 mod sequence;
+mod temporal;
 mod value;
 
 pub use error::CoreError;
@@ -41,10 +43,13 @@ pub use id::{
 pub use key::KeyBuf;
 pub use mutation::{
     DeclarationImage, GraphMutation, IndexImage, catalog_kind, decode_mutation,
-    decode_mutation_list, encode_mutation, encode_mutation_list, scope_kind,
+    decode_mutation_list, encode_mutation, encode_mutation_list, schema_change, scope_kind,
 };
+pub use numeric::{DECIMAL_DIGITS_MAX, DECIMAL_SCALE_MAX, Decimal};
 pub use sequence::CommitSeq;
+pub use temporal::{Date, Duration, LocalDateTime, Timestamp};
 pub use value::{
-    Value, ValueType, decode_f64_key, decode_i64_key, decode_value, decode_value_key,
-    encode_f64_key, encode_i64_key, encode_value, encode_value_key,
+    MAX_VALUE_DEPTH, Value, ValueType, decode_f64_key, decode_i64_key, decode_value,
+    decode_value_key, encode_f64_key, encode_i64_key, encode_value, encode_value_key, index_cmp,
+    predicate_cmp,
 };

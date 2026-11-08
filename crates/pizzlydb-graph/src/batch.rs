@@ -4,14 +4,16 @@
 //! can run at once. Commit validates reads, assigns a commit sequence, and
 //! writes the staged keys together with their logical mutations.
 
+use std::collections::BTreeSet;
 use std::vec::IntoIter;
 
-use pizzlydb_core::{CommitSeq, GraphMutation};
+use pizzlydb_core::{CommitSeq, GraphMutation, NamespaceId};
 use pizzlydb_storage::{LimitKind, Storage, StorageError, Vfs};
 use pizzlydb_txn::{Txn, TxnError, TxnManager, TxnOptions};
 
 use crate::access::{KeyRead, KeyValue};
 use crate::error::GraphError;
+use crate::property::Owner;
 
 /// Graph writes staged on one optimistic transaction.
 ///
@@ -51,6 +53,8 @@ use crate::error::GraphError;
 pub struct GraphTxn<V: Vfs> {
     txn: Txn<V>,
     mutations: Vec<GraphMutation>,
+    touched: BTreeSet<(NamespaceId, Owner)>,
+    schema_bumped: BTreeSet<NamespaceId>,
 }
 
 /// Same type as [`GraphTxn`].
@@ -100,6 +104,8 @@ impl<V: Vfs + 'static> GraphTxn<V> {
         Ok(Self {
             txn,
             mutations: Vec::new(),
+            touched: BTreeSet::new(),
+            schema_bumped: BTreeSet::new(),
         })
     }
 }
@@ -137,8 +143,10 @@ impl<V: Vfs> GraphTxn<V> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn commit(self) -> Result<Option<CommitSeq>, GraphError> {
-        let Self { txn, mutations } = self;
+    pub fn commit(mut self) -> Result<Option<CommitSeq>, GraphError> {
+        crate::constraint::validate_touched(&mut self)?;
+        crate::stats::apply(&mut self)?;
+        let Self { txn, mutations, .. } = self;
         Ok(txn.commit(&mutations)?)
     }
 
@@ -205,13 +213,67 @@ impl<V: Vfs> GraphTxn<V> {
         self.mutations.push(mutation);
     }
 
+    /// Remember `owner` for commit-time constraint checks.
+    pub(crate) fn note_owner(&mut self, namespace: NamespaceId, owner: Owner) {
+        self.touched.insert((namespace, owner));
+    }
+
+    pub(crate) fn touched(&self) -> Vec<(NamespaceId, Owner)> {
+        self.touched.iter().copied().collect()
+    }
+
+    /// `true` after this transaction has already incremented `namespace`'s schema version.
+    pub(crate) fn schema_was_bumped(&self, namespace: NamespaceId) -> bool {
+        self.schema_bumped.contains(&namespace)
+    }
+
+    pub(crate) fn mark_schema_bumped(&mut self, namespace: NamespaceId) {
+        self.schema_bumped.insert(namespace);
+    }
+
+    pub(crate) fn merge_add(&mut self, key: &[u8], delta: i64) -> Result<(), GraphError> {
+        self.txn.merge_add(key, delta)?;
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, GraphError> {
+        Ok(self.txn.snapshot_get(key)?)
+    }
+
+    pub(crate) fn for_each_staged(&self, visit: impl FnMut(&[u8], Option<&[u8]>)) {
+        self.txn.for_each_staged(visit);
+    }
+
+    pub(crate) fn stamp_commit(&mut self, key: &[u8], offset: usize) -> Result<(), GraphError> {
+        self.txn.stamp_commit(key, offset)?;
+        Ok(())
+    }
+
+    pub(crate) fn scan_capped(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        cap: usize,
+    ) -> Result<(Vec<KeyValue>, bool), GraphError> {
+        let (rows, truncated) = self.txn.scan_capped(start, end, cap)?;
+        Ok((rows, truncated))
+    }
+
     /// Reserve the next id of `kind` in `namespace`.
     pub(crate) fn allocate_id(
         &mut self,
         namespace: pizzlydb_core::NamespaceId,
         kind: u8,
     ) -> Result<u128, GraphError> {
-        Ok(self.txn.allocate_id(namespace.as_bytes(), kind)?)
+        self.allocate_raw(namespace.as_bytes(), kind)
+    }
+
+    pub(crate) fn allocate_raw(
+        &mut self,
+        namespace: &[u8; 16],
+        kind: u8,
+    ) -> Result<u128, GraphError> {
+        Ok(self.txn.allocate_id(namespace, kind)?)
     }
 
     /// Stage `value` at `key`.
@@ -246,10 +308,18 @@ impl<V: Vfs> GraphTxn<V> {
     ) -> Result<T, GraphError> {
         let owned = self.txn.begin_savepoint();
         let mark = self.mutations.len();
+        let touched = owned.then(|| self.touched.clone());
+        let bumped = owned.then(|| self.schema_bumped.clone());
         let result = op(self);
         if owned {
             if result.is_err() {
                 self.mutations.truncate(mark);
+                if let Some(touched) = touched {
+                    self.touched = touched;
+                }
+                if let Some(bumped) = bumped {
+                    self.schema_bumped = bumped;
+                }
                 self.txn.rollback_savepoint();
             } else {
                 self.txn.commit_savepoint();

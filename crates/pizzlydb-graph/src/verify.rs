@@ -2,7 +2,7 @@
 //!
 //! [`verify_full`] reads one snapshot. It does not stage writes.
 
-use crate::access::{IdScan, KeyRead, PrefixScan};
+use crate::access::{KeyRead, PrefixScan};
 use crate::adjacency::Direction;
 use crate::error::GraphError;
 use crate::index::IndexDefinition;
@@ -11,7 +11,7 @@ use crate::property::{Owner, Scope};
 use crate::record::EdgeRecord;
 use crate::record_store::GraphStore;
 use pizzlydb_core::{
-    EdgeId, ID_LEN, Identifier, IndexId, KeyBuf, LabelId, NodeId, TypeId, Value, decode_value_key,
+    EdgeId, ID_LEN, IndexId, KeyBuf, LabelId, NodeId, TypeId, Value, decode_value_key,
 };
 
 /// Check records, adjacency, membership, and index entries in `graph`'s namespace.
@@ -53,40 +53,66 @@ use pizzlydb_core::{
 /// ```
 pub fn verify_full<R: KeyRead>(graph: &GraphStore, view: &R) -> Result<(), GraphError> {
     let namespace = graph.namespace();
-    let nodes = scan_ids::<_, NodeId>(view, keys::node_keys(namespace))?;
-    for id in nodes {
+    for_each_prefix(view, &keys::node_keys(namespace), |key, _| {
+        if key.len() != keys::node_keys(namespace).len() + ID_LEN {
+            return Err(GraphError::VerificationFailed);
+        }
+        let id = id_at::<NodeId>(key, keys::node_keys(namespace).len())?;
         match graph.get_node(view, id) {
-            Ok(_) => {}
+            Ok(_) => Ok(()),
             Err(GraphError::Deleted) => {
                 if any_key(view, keys::adjacency_of(namespace, id))?
                     || any_key(view, keys::node_labels(namespace, id))?
                 {
-                    return Err(GraphError::VerificationFailed);
+                    Err(GraphError::VerificationFailed)
+                } else {
+                    Ok(())
                 }
             }
-            Err(err) => return Err(failed(err)),
+            Err(err) => Err(failed(err)),
         }
-    }
+    })?;
 
-    let edges = scan_ids::<_, EdgeId>(view, keys::edge_keys(namespace))?;
-    for id in edges {
-        match graph.get_edge(view, id) {
-            Ok(record) => check_live_edge(graph, view, &record)?,
-            Err(GraphError::Deleted) => {}
-            Err(err) => return Err(failed(err)),
+    for_each_prefix(view, &keys::edge_keys(namespace), |key, _| {
+        if key.len() != keys::edge_keys(namespace).len() + ID_LEN {
+            return Err(GraphError::VerificationFailed);
         }
-    }
+        let id = id_at::<EdgeId>(key, keys::edge_keys(namespace).len())?;
+        match graph.get_edge(view, id) {
+            Ok(record) => check_live_edge(graph, view, &record),
+            Err(GraphError::Deleted) => Ok(()),
+            Err(err) => Err(failed(err)),
+        }
+    })?;
 
     check_adjacency(graph, view)?;
     check_labels(graph, view)?;
     check_type_members(graph, view)?;
 
-    let indexes = scan_ids::<_, IndexId>(view, keys::index_keys(namespace))?;
-    for id in indexes {
-        let definition = graph.index(view, id).map_err(failed)?;
-        check_index(graph, view, id, definition)?;
-    }
+    for_each_prefix(view, &keys::index_keys(namespace), |key, _| {
+        if key.len() < ID_LEN {
+            return Err(GraphError::VerificationFailed);
+        }
+        let id = id_at::<IndexId>(key, key.len() - ID_LEN)?;
+        let state = graph.index_state(view, id).map_err(failed)?;
+        check_index(graph, view, id, state)
+    })?;
 
+    Ok(())
+}
+
+fn for_each_prefix<R: KeyRead>(
+    view: &R,
+    prefix: &[u8],
+    mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), GraphError>,
+) -> Result<(), GraphError> {
+    for item in view.scan(prefix).map_err(GraphError::Storage)? {
+        let (key, value) = item.map_err(GraphError::Storage)?;
+        if !key.starts_with(prefix) {
+            break;
+        }
+        visit(&key, &value)?;
+    }
     Ok(())
 }
 
@@ -209,31 +235,37 @@ fn check_index<R: KeyRead>(
     graph: &GraphStore,
     view: &R,
     index: IndexId,
-    definition: IndexDefinition,
+    state: crate::index::IndexState,
 ) -> Result<(), GraphError> {
-    let mut pending = Vec::new();
-    for owner in owners(graph, view, definition.scope)? {
-        if let Some(value) = graph
-            .get_property(view, owner, definition.key)
-            .map_err(failed)?
-        {
-            if definition.unique && value == Value::Null {
-                continue;
-            }
-            let mut encoded = Vec::new();
-            pizzlydb_core::encode_value_key(&value, &mut encoded)
-                .map_err(|_| GraphError::VerificationFailed)?;
-            pending.push((encoded, owner));
+    use crate::index::IndexPhase;
+
+    if state.phase == IndexPhase::Dropped {
+        let prefix = keys::index_entries(graph.namespace(), index, state.definition.unique);
+        if any_key(view, prefix)? {
+            return Err(GraphError::VerificationFailed);
         }
+        return Ok(());
+    }
+    if state.phase != IndexPhase::Ready {
+        return entries_match_stored(graph, view, index, state.definition);
     }
 
+    entries_match_stored(graph, view, index, state.definition)?;
+    members_are_indexed(graph, view, index, state.definition)
+}
+
+fn entries_match_stored<R: KeyRead>(
+    graph: &GraphStore,
+    view: &R,
+    index: IndexId,
+    definition: IndexDefinition,
+) -> Result<(), GraphError> {
     let prefix = keys::index_entries(graph.namespace(), index, definition.unique);
-    for entry in PrefixScan::new(view, prefix.clone()).map_err(failed)? {
-        let (key, stored) = entry.map_err(failed)?;
+    for_each_prefix(view, &prefix, |key, stored| {
         let suffix = key
             .get(prefix.len()..)
             .ok_or(GraphError::VerificationFailed)?;
-        let (encoded, owner) = split_entry(definition, suffix, &stored)?;
+        let (encoded, owner) = split_entry(definition, suffix, stored)?;
         let value = graph
             .get_property(view, owner, definition.key)
             .map_err(failed)?
@@ -241,23 +273,49 @@ fn check_index<R: KeyRead>(
         let mut actual = Vec::new();
         pizzlydb_core::encode_value_key(&value, &mut actual)
             .map_err(|_| GraphError::VerificationFailed)?;
-        if actual != encoded {
+        if actual.as_slice() != encoded {
             return Err(GraphError::VerificationFailed);
         }
-        let pos = pending
-            .iter()
-            .position(|(bytes, pending_owner)| bytes == &encoded && *pending_owner == owner);
-        let Some(pos) = pos else {
-            return Err(GraphError::VerificationFailed);
-        };
-        pending.remove(pos);
-    }
-
-    if pending.is_empty() {
         Ok(())
-    } else {
-        Err(GraphError::VerificationFailed)
-    }
+    })
+}
+
+fn members_are_indexed<R: KeyRead>(
+    graph: &GraphStore,
+    view: &R,
+    index: IndexId,
+    definition: IndexDefinition,
+) -> Result<(), GraphError> {
+    let namespace = graph.namespace();
+    let prefix = match definition.scope {
+        Scope::Label(label) => keys::label_members(namespace, label),
+        Scope::Type(edge_type) => keys::type_members(namespace, edge_type),
+    };
+    for_each_prefix(view, &prefix, |key, _| {
+        if key.len() < ID_LEN {
+            return Err(GraphError::VerificationFailed);
+        }
+        let owner = match definition.scope {
+            Scope::Label(_) => Owner::Node(id_at(key, key.len() - ID_LEN)?),
+            Scope::Type(_) => Owner::Edge(id_at(key, key.len() - ID_LEN)?),
+        };
+        let Some(value) = graph
+            .get_property(view, owner, definition.key)
+            .map_err(failed)?
+        else {
+            return Ok(());
+        };
+        if definition.unique && value == Value::Null {
+            return Ok(());
+        }
+        let entry =
+            crate::index::index_entry_key(namespace, index, definition.unique, owner, &value)
+                .map_err(|_| GraphError::VerificationFailed)?;
+        if !has_key(view, &entry)? {
+            return Err(GraphError::VerificationFailed);
+        }
+        Ok(())
+    })
 }
 
 fn split_entry(
@@ -295,29 +353,6 @@ fn split_entry(
     Ok((value_bytes.to_vec(), owner))
 }
 
-fn owners<R: KeyRead>(
-    graph: &GraphStore,
-    view: &R,
-    scope: Scope,
-) -> Result<Vec<Owner>, GraphError> {
-    let namespace = graph.namespace();
-    match scope {
-        Scope::Label(label) => {
-            let nodes = scan_ids::<_, NodeId>(view, keys::label_members(namespace, label))?;
-            Ok(nodes.into_iter().map(Owner::Node).collect())
-        }
-        Scope::Type(edge_type) => {
-            let edges = scan_ids::<_, EdgeId>(view, keys::type_members(namespace, edge_type))?;
-            Ok(edges.into_iter().map(Owner::Edge).collect())
-        }
-    }
-}
-
-fn scan_ids<R: KeyRead, I: Identifier>(read: &R, prefix: Vec<u8>) -> Result<Vec<I>, GraphError> {
-    let scan = IdScan::new(read, prefix).map_err(failed)?;
-    scan.map(|item| item.map_err(failed)).collect()
-}
-
 fn any_key<R: KeyRead>(read: &R, prefix: Vec<u8>) -> Result<bool, GraphError> {
     let mut scan = PrefixScan::new(read, prefix).map_err(failed)?;
     Ok(scan.next().transpose().map_err(failed)?.is_some())
@@ -327,7 +362,7 @@ fn has_key<R: KeyRead>(read: &R, key: &[u8]) -> Result<bool, GraphError> {
     Ok(read.get(key)?.is_some())
 }
 
-fn id_at<I: Identifier>(bytes: &[u8], offset: usize) -> Result<I, GraphError> {
+fn id_at<I: pizzlydb_core::Identifier>(bytes: &[u8], offset: usize) -> Result<I, GraphError> {
     crate::access::id_at(bytes, offset).map_err(|_| GraphError::VerificationFailed)
 }
 
